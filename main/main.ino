@@ -2,17 +2,38 @@
 #include <SparkFun_VL53L1X.h>
 
 const int FLEX_PIN = A1;
-const float FIXED_RESISTOR = 10000.0;  // Measured 10 kOhm
-const unsigned long FLEX_INTERVAL_MS = 100;
+const int IR_PIN = A2;
+
+const float FIXED_RESISTOR = 10000.0;  // 10 kOhm
+const float ADC_REFERENCE_V = 5.0;
+const unsigned long READ_INTERVAL_MS = 100;
 
 SFEVL53L1X tof;
 bool tofAvailable = false;
 
-unsigned long lastFlexReading = 0;
+unsigned long lastAnalogReading = 0;
 unsigned long lastTofReading = 0;
+
+// Average samples, discarding the first after switching channels.
+float readAverage(int pin) {
+  analogRead(pin);
+  delayMicroseconds(200);
+
+  long total = 0;
+
+  for (int i = 0; i < 10; i++) {
+    total += analogRead(pin);
+    delay(1);
+  }
+
+  return total / 10.0;
+}
 
 void setup() {
   Serial.begin(115200);
+
+  pinMode(FLEX_PIN, INPUT);
+  pinMode(IR_PIN, INPUT);
 
   Wire.begin();
   Wire.setClock(100000);
@@ -24,50 +45,55 @@ void setup() {
     tof.setTimingBudgetInMs(50);
     tof.setIntermeasurementPeriod(100);
     tof.startRanging();
-    lastTofReading = millis();
 
+    lastTofReading = millis();
     Serial.println("TOF ready");
   } else {
-    Serial.println("ERROR: TOF not detected. Flex readings continue.");
+    Serial.println("ERROR: TOF not detected. Analog readings continue.");
   }
+
+  Serial.println("FLEX=A1 IR=A2");
 }
 
 void loop() {
   unsigned long now = millis();
 
-  // Read the flex sensor approximately every 100 ms.
-  if (now - lastFlexReading >= FLEX_INTERVAL_MS) {
-    lastFlexReading = now;
+  if (now - lastAnalogReading >= READ_INTERVAL_MS) {
+    lastAnalogReading = now;
 
-    long total = 0;
-    for (int i = 0; i < 10; i++) {
-      total += analogRead(FLEX_PIN);
-      delay(2);
-    }
-
-    float adc = total / 10.0;
-    float voltage = adc * 5.0 / 1023.0;
+    // Flex sensor on A1.
+    float flexAdc = readAverage(FLEX_PIN);
+    float flexVoltage = flexAdc * ADC_REFERENCE_V / 1023.0;
 
     Serial.print("FLEX ADC=");
-    Serial.print(adc, 1);
+    Serial.print(flexAdc, 1);
     Serial.print(" Voltage_V=");
-    Serial.print(voltage, 2);
+    Serial.print(flexVoltage, 3);
 
-    if (adc > 0) {
-      float resistance =
-          FIXED_RESISTOR * (1023.0 / adc - 1.0);
+    if (flexAdc > 0) {
+      float flexResistance =
+          FIXED_RESISTOR * (1023.0 / flexAdc - 1.0);
 
       Serial.print(" Resistance_kOhm=");
-      Serial.println(resistance / 1000.0, 2);
+      Serial.println(flexResistance / 1000.0, 2);
     } else {
       Serial.println(" ERROR=Check_wiring");
     }
+
+    // Sharp infrared distance sensor on A2.
+    float irAdc = readAverage(IR_PIN);
+    float irVoltage = irAdc * ADC_REFERENCE_V / 1023.0;
+
+    Serial.print("IR ADC=");
+    Serial.print(irAdc, 1);
+    Serial.print(" Voltage_V=");
+    Serial.println(irVoltage, 3);
   }
 
-  // Read the ToF sensor whenever a measurement is ready.
+  // VL53L1X ToF sensor over I2C.
   if (tofAvailable) {
     if (tof.checkForDataReady()) {
-      int distance = tof.getDistance();
+      int distanceMm = tof.getDistance();
       byte status = tof.getRangeStatus();
       tof.clearInterrupt();
 
@@ -76,7 +102,7 @@ void loop() {
 
       if (status == 0) {
         Serial.print(" Distance_mm=");
-        Serial.println(distance);
+        Serial.println(distanceMm);
       } else {
         Serial.println(" Invalid_measurement");
       }
