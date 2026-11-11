@@ -1,0 +1,18 @@
+{
+  "name": "ego2sim-mock-server",
+  "version": "1.0.0",
+  "description": "Mock ego2sim backend speaking the Foxglove WebSocket protocol",
+  "main": "mock-server.js",
+  "scripts": {
+    "start": "node mock-server.js"
+  },
+  "license": "UNLICENSED",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@foxglove/rosmsg": "^5.0.5",
+    "@foxglove/rosmsg2-serialization": "^3.1.2",
+    "@foxglove/ws-protocol": "^0.8.0",
+    "ws": "^8.22.2"
+  }
+}

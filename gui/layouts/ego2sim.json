@@ -1,0 +1,66 @@
+{
+  "configById": {
+    "the-simsons.ego2sim-panel.Ego2Sim Control!e2s": {},
+    "Plot!irfilter": {
+      "paths": [
+        { "value": "/ego2sim/sensors/ir/range.range", "enabled": true, "timestampMethod": "receiveTime", "label": "IR range (unfiltered)" },
+        { "value": "/ego2sim/sensors/ir/range_filtered.range", "enabled": true, "timestampMethod": "receiveTime", "label": "IR range (filtered)" }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 20,
+      "title": "Sharp IR: raw vs filtered (m)"
+    },
+    "Plot!flexfilter": {
+      "paths": [
+        { "value": "/ego2sim/sensors/flex/angle.value", "enabled": true, "timestampMethod": "receiveTime", "label": "Flex angle (unfiltered)" },
+        { "value": "/ego2sim/sensors/flex/angle_filtered.value", "enabled": true, "timestampMethod": "receiveTime", "label": "Flex angle (filtered)" }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 20,
+      "title": "Flex: raw vs filtered (rad)"
+    },
+    "Plot!motors": {
+      "paths": [
+        { "value": "/ego2sim/motors/dc/state.velocity_rad_s", "enabled": true, "timestampMethod": "receiveTime", "label": "DC velocity (rad/s)" },
+        { "value": "/ego2sim/motors/dc/state.target", "enabled": true, "timestampMethod": "receiveTime", "label": "DC target" }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 20,
+      "title": "DC motor: velocity vs target"
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": { "speed": 1 },
+  "layout": {
+    "direction": "row",
+    "first": "the-simsons.ego2sim-panel.Ego2Sim Control!e2s",
+    "second": {
+      "direction": "column",
+      "first": "Plot!irfilter",
+      "second": {
+        "direction": "column",
+        "first": "Plot!flexfilter",
+        "second": "Plot!motors",
+        "splitPercentage": 50
+      },
+      "splitPercentage": 33
+    },
+    "splitPercentage": 60
+  }
+}
