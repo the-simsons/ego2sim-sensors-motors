@@ -84,6 +84,21 @@ source ~/ego2sim_ws/install/setup.bash     # workspace with ego2sim_interfaces
 ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765
 ```
 
+When building from this repository's root, the workspace setup is
+`install/setup.bash`. You can start the bridge from that root with
+`./ros/scripts/start_foxglove_bridge.bash port:=8765`; it sources Humble and the
+backend workspace and checks that `ego2sim_interfaces` is discoverable before
+launching. For another build workspace, set `EGO2SIM_SETUP` to its
+`install/setup.bash`. Source the workspace before starting **foxglove_bridge**;
+the desktop application's startup order does not affect ROS type discovery.
+
+The backend now matches the panel/mock/layout flex angle payloads:
+`ego2sim_interfaces/msg/ScalarStamped`, with radians in `value` and availability in
+`valid`, on both `sensors/flex/angle` and `sensors/flex/angle_filtered`. Raw flex
+remains ScalarStamped ADC counts. Rebuild and restart the backend/bridge after
+updating from the earlier JointState backend; the old publisher must not run on
+these topics alongside the new version.
+
 In Foxglove: *Open connection* → *Foxglove WebSocket* → `ws://localhost:8765`.
 
 ## Running against the mock backend
