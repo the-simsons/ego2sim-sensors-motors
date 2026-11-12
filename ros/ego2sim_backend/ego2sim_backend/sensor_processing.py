@@ -1,3 +1,4 @@
+"""Optional host calibration/filtering; launch only with firmware publication disabled."""
 import math
 import rclpy
 from rclpy.node import Node
@@ -5,7 +6,7 @@ from rclpy.parameter import Parameter
 from sensor_msgs.msg import Illuminance, Range
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from ego2sim_interfaces.msg import ScalarStamped
-from .processing import Calibration, LowPass, sonar, NAN
+from .processing import Calibration, LowPass, sonar_pulse, NAN
 from .serial_bridge import qos, range_message
 
 class SensorProcessing(Node):
@@ -15,8 +16,8 @@ class SensorProcessing(Node):
             return self.declare_parameter(name,default).value
         tau = param('filter_tau_s',.2)
         stale = param('filter_stale_s',1.)
-        self.supply = param('sonar_supply_v',5.)
-        sonar(NAN,self.supply)
+        self.sonar_scale = param('sonar_us_per_inch',147.)
+        sonar_pulse(NAN,self.sonar_scale)
         self.ir_fov = param('ir_fov_rad',NAN)
         self.sonar_fov = param('sonar_fov_rad',NAN)
         self.cal = {}
@@ -34,7 +35,7 @@ class SensorProcessing(Node):
             self.pubs[s] = self.create_publisher(typ,f'sensors/{s}/{topic}',qos())
             self.filtered[s] = self.create_publisher(typ,f'sensors/{s}/{topic}_filtered',qos())
         self.sonar_pub = self.create_publisher(Range,'sensors/ultrasonic/range',qos())
-        for s,topic in [('flex','raw'),('light','raw_voltage'),('ir','raw_voltage'),('ultrasonic','raw_voltage')]:
+        for s,topic in [('flex','raw'),('light','raw_voltage'),('ir','raw_voltage'),('ultrasonic','raw_pulse_width')]:
             self.create_subscription(ScalarStamped,f'sensors/{s}/{topic}',
                                      lambda msg,s=s:self.process(s,msg),qos())
 
@@ -62,7 +63,7 @@ class SensorProcessing(Node):
         raw = msg.value if msg.valid and math.isfinite(msg.value) else NAN
         if s == 'ultrasonic':
             self.sonar_pub.publish(range_message(msg.header.stamp,msg.header.frame_id,
-                sonar(raw,self.supply),Range.ULTRASOUND,.1524,6.4516,self.sonar_fov))
+                sonar_pulse(raw,self.sonar_scale),Range.ULTRASOUND,.1524,6.4516,self.sonar_fov))
             return
         value = self.cal[s].convert(raw)
         if s == 'ir' and not .2 <= value <= 1.5:

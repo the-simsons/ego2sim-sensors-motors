@@ -135,3 +135,13 @@ npm run build      # compile to dist/
 npm run lint
 npm run package    # build a .foxe file (drag it onto Foxglove to install)
 ```
+
+## Current firmware integration
+
+The ROS adapter now matches main/main.ino. Ultrasonic raw data uses
+`/ego2sim/sensors/ultrasonic/raw_pulse_width` in µs. Rebuild/reinstall the panel
+after updating. Sensor conversion/filtering comes from firmware by default;
+flex/light/IR physical values require verified calibration flags in the backend
+configuration. Command acceptance is confirmed through motor feedback; rejection
+and unknown outcomes appear in diagnostics. No automatic command retries occur.
+See `../ros/README.md` for the short build/start instructions.

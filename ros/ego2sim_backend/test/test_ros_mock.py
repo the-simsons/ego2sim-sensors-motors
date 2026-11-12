@@ -1,4 +1,4 @@
-"""Exercises generated messages, DDS topics and both nodes when Humble is sourced."""
+"""Exercises generated messages, DDS topics and the firmware adapter when Humble is sourced."""
 import importlib.util
 import math
 import time
@@ -11,7 +11,6 @@ class RosMockIntegrationTests(unittest.TestCase):
         from rclpy.executors import SingleThreadedExecutor
         from rclpy.node import Node
         from ego2sim_backend.serial_bridge import SerialBridge,qos
-        from ego2sim_backend.sensor_processing import SensorProcessing
         from ego2sim_interfaces.msg import ScalarStamped,MotorState,MotorCommand,ControlMode
         from sensor_msgs.msg import Range,Illuminance
         from diagnostic_msgs.msg import DiagnosticArray
@@ -19,8 +18,8 @@ class RosMockIntegrationTests(unittest.TestCase):
         nodes = []
         executor = SingleThreadedExecutor()
         try:
-            bridge,processor,observer = SerialBridge(),SensorProcessing(),Node('test_observer')
-            nodes = [bridge,processor,observer]
+            bridge,observer = SerialBridge(),Node('test_observer')
+            nodes = [bridge,observer]
             seen = {}
             specs = {
                 'sensors/flex/raw':ScalarStamped,'sensors/flex/angle':ScalarStamped,
@@ -28,7 +27,7 @@ class RosMockIntegrationTests(unittest.TestCase):
                 'sensors/light/illuminance':Illuminance,'sensors/light/illuminance_filtered':Illuminance,
                 'sensors/ir/raw_voltage':ScalarStamped,'sensors/ir/range':Range,
                 'sensors/ir/range_filtered':Range,'sensors/tof/range':Range,
-                'sensors/ultrasonic/raw_voltage':ScalarStamped,'sensors/ultrasonic/range':Range,
+                'sensors/ultrasonic/raw_pulse_width':ScalarStamped,'sensors/ultrasonic/range':Range,
                 'motors/servo/state':MotorState,'motors/dc/state':MotorState,
                 'motors/stepper/state':MotorState,'diagnostics':DiagnosticArray}
             subscriptions = [observer.create_subscription(typ,topic,
@@ -49,8 +48,7 @@ class RosMockIntegrationTests(unittest.TestCase):
             self.assertTrue(math.isnan(seen['sensors/light/illuminance'].illuminance))
             self.assertTrue(math.isnan(seen['sensors/ir/range'].range))
             self.assertAlmostEqual(seen['sensors/ultrasonic/range'].range,.6096,places=4)
-            from ego2sim_backend.processing import Calibration
-            processor.cal['flex'] = Calibration([0.,1023.],[0.,1.57])
+            bridge.calibration.update(flex=True,light=True,ir=True)
             spin_until(lambda:seen['sensors/flex/angle'].valid and
                        seen['sensors/flex/angle_filtered'].valid)
             angle = seen['sensors/flex/angle']
@@ -62,11 +60,11 @@ class RosMockIntegrationTests(unittest.TestCase):
             msg = MotorCommand(); msg.command_id=123; msg.motor=2; msg.operation=1; msg.target=.2
             command.publish(msg)
             spin_until(lambda:seen['motors/stepper/state'].last_command_id==123 and
-                       abs(seen['motors/stepper/state'].position_rad-.2)<1e-5)
+                       abs(seen['motors/stepper/state'].position_rad-round(.2/(math.tau/1600))*(math.tau/1600))<1e-5)
             command.publish(msg) # Duplicate must not move a second time.
             until = time.monotonic()+.5
             while time.monotonic()<until: executor.spin_once(timeout_sec=.02)
-            self.assertAlmostEqual(seen['motors/stepper/state'].position_rad,.2,places=5)
+            self.assertAlmostEqual(seen['motors/stepper/state'].position_rad,round(.2/(math.tau/1600))*(math.tau/1600),places=5)
             self.assertFalse(seen['motors/stepper/state'].position_measured)
             m = ControlMode(); m.mode=1; mode.publish(m)
             spin_until(lambda:seen['motors/stepper/state'].control_mode==1)

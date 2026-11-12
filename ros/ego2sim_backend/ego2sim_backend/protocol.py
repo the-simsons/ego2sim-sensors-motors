@@ -1,23 +1,34 @@
-"""Version 1 bounded ASCII protocol; all state is owned by the executor thread."""
-from collections import deque
-import math
-import secrets
+"""Wire contract implemented by main/main.ino (unversioned newline-delimited ASCII).
 
+No synthetic handshake, ACK or watchdog is added: acceptance comes from MS records.
+"""
+from collections import deque, OrderedDict
+from dataclasses import dataclass
+import math
+import re
+
+NAN = float('nan')
 SENSORS = ('flex', 'light', 'ir', 'tof', 'ultrasonic')
+SENSOR_FIELDS = ('flex_adc','flex_rad','flex_rad_f','light_v','lux','lux_f',
+                 'ir_v','ir_m','ir_m_f','tof_m','sonar_pulse_us','sonar_m')
+FIRMWARE_LIMITS = dict(servo_min=0., servo_max=math.pi,
+                       move_max=20*math.pi, velocity_max=100*math.tau/60)
+BOOT = 'ego2sim firmware ready'
+REJECTION = re.compile(r'^Rejected command #(\d+): (.*)$')
+
 
 def integer(s, maximum=0xffffffff):
-    if not s.isascii() or not s.isdecimal():
-        raise ValueError('Expected unsigned integer')
-    n = int(s)
-    if n > maximum:
-        raise ValueError('Integer overflow')
+    if not s.isascii() or not s.isdecimal() or int(s) > maximum:
+        raise ValueError('Expected bounded unsigned integer')
+    return int(s)
+
+
+def number(s, allow_inf=False):
+    n = float(s)
+    if math.isinf(n) and not allow_inf:
+        raise ValueError('Unexpected infinite measurement')
     return n
 
-def number(s, finite=False):
-    n = float(s)
-    if math.isinf(n) or (finite and not math.isfinite(n)):
-        raise ValueError('Nonfinite number')
-    return n
 
 class Framer:
     def __init__(self, limit=256):
@@ -27,10 +38,10 @@ class Framer:
     def feed(self, data):
         lines = []
         for c in data:
-            if c == 10:
-                if not self.discard:
+            if c in (10, 13):
+                if not self.discard and self.buffer:
                     try:
-                        lines.append(self.buffer.decode('ascii').rstrip('\r'))
+                        lines.append(self.buffer.decode('ascii'))
                     except UnicodeDecodeError:
                         self.errors += 1
                 self.buffer.clear()
@@ -44,110 +55,168 @@ class Framer:
                     self.buffer.append(c)
         return lines
 
-def parse(line):
-    p = line.split(',')
-    if len(p) < 2 or p[1] != '1':
-        raise ValueError('Unsupported protocol')
-    kind = p[0]
-    if kind == 'B' and len(p) == 2:
-        return {'kind': kind}
-    if kind == 'H' and len(p) == 6:
-        return dict(kind=kind, session=integer(p[2]), ms=integer(p[3]),
-                    mode=integer(p[4], 1), watchdog=integer(p[5], 1))
-    if kind == 'T' and len(p) == 7 and p[4] in SENSORS:
-        status = integer(p[5], 255)
-        value = number(p[6], finite=status == 0)
-        if status == 0:
-            lo, hi = {'flex': (0,1023), 'tof': (0,4000)}.get(p[4], (0, 20))
-            if not lo <= value <= hi:
-                raise ValueError('Telemetry out of bounds')
-        return dict(kind=kind, seq=integer(p[2]), ms=integer(p[3]), sensor=p[4],
-                    status=status, value=value if status == 0 else float('nan'))
-    if kind == 'A' and len(p) == 6:
-        return dict(kind=kind, session=integer(p[2]), id=integer(p[3]),
-                    accepted=integer(p[4],1), reason=p[5])
-    if kind == 'R' and len(p) == 6:
-        return dict(kind=kind, session=integer(p[2]), mode=integer(p[3],1),
-                    accepted=integer(p[4],1), reason=p[5])
-    if kind == 'S' and len(p) == 18:
-        return dict(kind=kind, seq=integer(p[2]), ms=integer(p[3]), motor=integer(p[4],2),
-                    mode=integer(p[5],1), enabled=integer(p[6],1), moving=integer(p[7],1),
-                    position=number(p[8]), velocity=number(p[9]), operation=integer(p[10],3),
-                    target=number(p[11]), pm=integer(p[12],1), vm=integer(p[13],1),
-                    last_id=integer(p[14]), session=integer(p[15]), status=p[16],
-                    watchdog=integer(p[17],1))
-    raise ValueError('Malformed record')
 
-def validate_command(motor, operation, target, limits):
+def parse(line):
+    kind = line.split(',', 1)[0]
+    if kind == 'S':
+        p = line.split(',')
+        if len(p) != 14:
+            raise ValueError('S needs 14 fields')
+        values = {name:number(value, name in ('ir_m','ir_m_f'))
+                  for name,value in zip(SENSOR_FIELDS,p[2:])}
+        for key,maximum in [('flex_adc',1023),('light_v',5.1),('ir_v',5.1)]:
+            v = values[key]
+            if math.isfinite(v) and not 0 <= v <= maximum:
+                raise ValueError('Raw sensor value out of bounds')
+        if math.isfinite(values['sonar_pulse_us']) and values['sonar_pulse_us'] < 0:
+            raise ValueError('Negative sonar pulse')
+        return dict(kind=kind, ms=integer(p[1]), **values)
+    if kind == 'MS':
+        # Status text contains commas (e.g. "stopped, sensor control paused").
+        p = line.split(',', 13)
+        if len(p) != 14 or not p[13]:
+            raise ValueError('MS needs 14 fields and a status')
+        return dict(kind=kind, ms=integer(p[1]), motor=integer(p[2],2),
+                    mode=integer(p[3],1), operation=integer(p[4],3),
+                    enabled=integer(p[5],1), moving=integer(p[6],1),
+                    position=number(p[7]), velocity=number(p[8]), target=number(p[9]),
+                    pm=integer(p[10],1), vm=integer(p[11],1),
+                    last_id=integer(p[12]), status=p[13])
+    if kind == 'D':
+        p = line.split(',',3)
+        if len(p) != 4 or not p[2] or not p[3]:
+            raise ValueError('Malformed diagnostic')
+        return dict(kind=kind, level=integer(p[1],2), name=p[2], message=p[3])
+    if kind == 'I' and ',' in line:
+        return dict(kind=kind, message=line.split(',',1)[1])
+    raise ValueError('Unknown firmware record')
+
+
+class UptimeTracker:
+    """Detect backward MCU uptime, permitting uint32 millis rollover and equal stamps."""
+    def __init__(self):
+        self.last = None
+
+    def update(self, ms):
+        restarted = self.last is not None and (ms-self.last) % 2**32 >= 2**31
+        self.last = ms
+        return restarted
+
+
+def validate_command(motor, operation, target, limits=None):
     if motor not in (0,1,2) or operation not in (0,1,2,3) or not math.isfinite(target):
         raise ValueError('Invalid command fields')
     if operation == 3:
         return
     if operation not in ((0,), (1,2), (1,))[motor]:
         raise ValueError('Unsupported motor operation')
+    effective = dict(FIRMWARE_LIMITS)
+    if limits:
+        effective['servo_min'] = max(0.,limits['servo_min'])
+        for key in ('servo_max','move_max','velocity_max'):
+            effective[key] = min(effective[key],limits[key])
     if motor == 0:
-        valid = limits['servo_min'] <= target <= limits['servo_max']
+        valid = effective['servo_min'] <= target <= effective['servo_max']
     else:
-        valid = abs(target) <= limits['velocity_max' if operation == 2 else 'move_max']
+        valid = abs(target) <= effective['velocity_max' if operation == 2 else 'move_max']
     if not valid:
-        raise ValueError('Command exceeds configured limits')
+        raise ValueError('Command exceeds firmware/configured limit')
+
+
+@dataclass
+class Outcome:
+    command_id: int
+    motor: int
+    result: str
+    detail: str
+
 
 class Session:
-    def __init__(self, limits, ack_timeout=1.0):
-        self.limits, self.ack_timeout = limits, ack_timeout
+    def __init__(self, limits=None, ack_timeout=2., stale_timeout=1.):
+        self.limits = limits or FIRMWARE_LIMITS
+        self.ack_timeout, self.stale_timeout = ack_timeout, stale_timeout
         self.pending, self.outcomes = {}, deque(maxlen=64)
-        self.high_id = -1
-        self.reset()
-
-    def reset(self):
-        for cid in self.pending:
-            self.outcomes.append((cid, 'unknown: connection/reset; not retried'))
-        self.pending.clear()
-        self.token = secrets.randbelow(0xfffffffe)+1
-        self.ready, self.mode, self.seq = False, 0, None
+        self.issued = OrderedDict()
+        self.high_id = 0  # Firmware uses last_command_id=0 to mean no command yet.
+        self.connected = False
+        self.ready = False
+        self.mode = None
+        self.motor_seen = {}
+        self.uptime = UptimeTracker()
         self.acquisition_ms = {}
-        # Keep high-water mark across reconnects: GUI must never replay an ID.
-        return f'X,1,{self.token}\n'
 
-    def receive(self, record):
+    def reset(self, connected=False, reason='connection/reset'):
+        for cid, pending in self.pending.items():
+            pending['result'] = 'unknown'
+            self.outcomes.append(Outcome(cid,pending['motor'],'unknown',reason+'; not retried'))
+        self.pending.clear()
+        self.connected, self.ready, self.mode = connected, False, None
+        self.motor_seen.clear()
+        self.acquisition_ms.clear()
+        self.uptime = UptimeTracker()
+        # Retain the ID high-water mark across resets and reconnects.
+
+    def receive(self, record, now):
         k = record['kind']
-        if k == 'B':
-            return self.reset()
-        if k == 'H' and record['session'] == self.token:
+        restart = k == 'I' and record['message'] == BOOT
+        if k in ('S','MS'):
+            restart = self.uptime.update(record['ms']) or restart
+        if restart:
+            self.reset(connected=self.connected,reason='firmware restarted')
+            if k in ('S','MS'):
+                self.uptime.update(record['ms'])
+        if k == 'MS' and self.connected:
             self.ready, self.mode = True, record['mode']
-        if not self.ready:
-            return None
-        if k in ('A','S','R') and record['session'] != self.token:
-            return None
-        if k == 'A':
-            cid = record['id']
-            if cid in self.pending:
-                self.pending.pop(cid)
-                self.outcomes.append((cid, ('accepted:' if record['accepted'] else 'rejected:')+record['reason']))
-        if k in ('T','S'):
-            seq = record['seq']
-            if self.seq is not None and not 0 < (seq-self.seq) % 2**32 < 2**31:
-                raise ValueError('Duplicate/out-of-order sequence; awaiting boot handshake')
-            self.seq = seq
-            self.acquisition_ms[record.get('sensor', 'motor'+str(record.get('motor')))] = record['ms']
-        return None
+            self.motor_seen[record['motor']] = now
+            self.acquisition_ms['motor'+str(record['motor'])] = record['ms']
+            cid = record['last_id']
+            if cid in self.issued and self.issued[cid]['motor'] == record['motor'] and self.issued[cid]['result'] != 'accepted':
+                self.issued[cid]['result'] = 'accepted'
+                self.pending.pop(cid,None)
+                self.outcomes.append(Outcome(cid,record['motor'],'accepted','confirmed by firmware MS'))
+        elif k == 'S':
+            self.acquisition_ms['sensors'] = record['ms']
+        elif k == 'D' and record['name'] == 'motor_command':
+            match = REJECTION.fullmatch(record['message'])
+            if match:
+                cid = integer(match[1])
+                pending = self.issued.get(cid)
+                if pending and pending['result'] in ('pending','unknown'):
+                    self.pending.pop(cid,None)
+                    pending['result'] = 'rejected'
+                    self.outcomes.append(Outcome(cid,pending['motor'],'rejected',match[2]))
+        return restart
 
     def command(self, cid, motor, operation, target, now):
-        if not self.ready:
-            raise ValueError('Firmware handshake not complete')
-        if not 0 <= cid <= 0xffffffff or cid <= self.high_id:
-            raise ValueError('Duplicate/out-of-order command ID')
+        if not self.connected:
+            raise ValueError('Serial disconnected')
+        if not isinstance(cid,int) or not 1 <= cid <= 0xffffffff or cid <= self.high_id:
+            raise ValueError('Command ID must be nonzero and strictly increasing; no replay')
         validate_command(motor,operation,target,self.limits)
-        if self.mode != 0 and operation != 3:
-            raise ValueError('GUI command forbidden in SENSOR mode')
+        if operation != 3:
+            if not self.ready or now-self.motor_seen.get(motor,-math.inf) > self.stale_timeout:
+                raise ValueError('No fresh firmware feedback for this motor')
+            if self.mode != 0:
+                raise ValueError('Motion commands require reported GUI mode')
         if len(self.pending) >= 64:
             raise ValueError('Too many pending commands')
+        line = f'C,{cid},{motor},{operation},{target:.9g}\n'
+        if len(line.rstrip('\n')) > 47:
+            raise ValueError('Command exceeds firmware line buffer')
         self.high_id = cid
-        self.pending[cid] = now
-        return f'C,1,{self.token},{cid},{motor},{operation},{target:.9g}\n'
+        self.pending[cid] = dict(motor=motor,sent=now,result='pending')
+        self.issued[cid] = self.pending[cid]
+        while len(self.issued) > 128:
+            oldest = next(k for k in self.issued if k not in self.pending)
+            self.issued.pop(oldest)
+        return line
 
     def expire(self, now):
-        for cid, sent in list(self.pending.items()):
-            if now-sent > self.ack_timeout:
+        for cid,pending in list(self.pending.items()):
+            if now-pending['sent'] > self.ack_timeout:
                 self.pending.pop(cid)
-                self.outcomes.append((cid, 'unknown: ACK timeout; not retried'))
+                pending['result'] = 'unknown'
+                self.outcomes.append(Outcome(cid,pending['motor'],'unknown',
+                    'no MS confirmation; outcome unknown; not retried'))
+        if self.motor_seen and now-max(self.motor_seen.values()) > self.stale_timeout:
+            self.ready = False

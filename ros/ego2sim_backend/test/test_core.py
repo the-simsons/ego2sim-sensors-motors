@@ -1,17 +1,19 @@
-import importlib.util
 import math
-import queue
 import sys
 import threading
 import time
 import types
 import unittest
 from unittest.mock import patch
-from ego2sim_backend.processing import Calibration, LowPass, sonar
-from ego2sim_backend.protocol import Framer, Session, parse, validate_command
-from ego2sim_backend.transport import MockTransport, SerialTransport
+from ego2sim_backend.processing import Calibration,LowPass,sonar,sonar_pulse
+from ego2sim_backend.protocol import Framer,Session,UptimeTracker,FIRMWARE_LIMITS,parse,validate_command
+from ego2sim_backend.telemetry import sensor_values
+from ego2sim_backend.transport import MockTransport,SerialTransport
 
-LIMITS = dict(servo_min=0.,servo_max=math.pi,move_max=2*math.pi,velocity_max=10.)
+SAMPLE = 'S,1234,500,0.4,0.3,1.000,200.0,190.0,1.200,inf,-inf,0.650,3528,0.6096'
+
+def state(cid=0,motor=1,mode=0,ms=1234,status='idle'):
+    return parse(f'MS,{ms},{motor},{mode},3,1,0,0.0,0.0,0.0,1,1,{cid},{status}')
 
 class ProcessingTests(unittest.TestCase):
     def test_missing_and_bounded_calibration(self):
@@ -45,127 +47,149 @@ class ProcessingTests(unittest.TestCase):
             self.assertTrue(math.isnan(sonar(v,5)))
         with self.assertRaises(ValueError): sonar(1,0)
 
+
 class ProtocolTests(unittest.TestCase):
-    def session(self):
-        s = Session(LIMITS)
-        s.receive(parse(f'H,1,{s.token},0,0,0'))
+    def ready(self):
+        s=Session(); s.reset(connected=True)
+        for i in range(3): s.receive(state(motor=i),0.)
         return s
 
-    def test_partial_multiple_and_overlong_frames(self):
-        f = Framer(32)
-        self.assertEqual(f.feed(b'T,1,1,'),[])
-        self.assertEqual(f.feed(b'10,flex,0,500\r\nB,1\n'),['T,1,1,10,flex,0,500','B,1'])
-        self.assertEqual(f.feed(b'x'*100+b'\nB,1\n'),['B,1'])
+    def test_partial_crlf_overflow_and_non_ascii(self):
+        f=Framer(32)
+        self.assertEqual(f.feed(b'I,hello'),[])
+        self.assertEqual(f.feed(b' world\r\nI,next\n'),['I,hello world','I,next'])
+        self.assertEqual(f.feed(b'x'*100+b'\nI,ok\n'),['I,ok'])
         self.assertEqual(f.feed(b'\xff\n'),[])
         self.assertEqual(f.errors,2)
         self.assertLessEqual(len(f.buffer),32)
 
-    def test_parser_validation(self):
-        self.assertEqual(parse('T,1,3,12,ir,0,1.2')['value'],1.2)
-        self.assertTrue(math.isnan(parse('T,1,4,13,tof,2,123')['value']))
-        for text in ('T,2,1,1,flex,0,1','T,1,-1,1,flex,0,1','T,1,1,1,flex,0,nan',
-                     'T,1,1,1,other,0,1','T,1,1,1,flex,0,1024','A,1,1,0,2,OK',
-                     'H,1,4294967296,0,0,0','junk','T,1,1,1,tof,0,inf'):
-            with self.subTest(text=text),self.assertRaises(ValueError): parse(text)
+    def test_firmware_packet_shapes_and_commas(self):
+        s=parse(SAMPLE)
+        self.assertEqual(s['sonar_pulse_us'],3528.)
+        self.assertEqual(s['tof_m'],.65)
+        self.assertEqual(s['ir_m'],math.inf)
+        self.assertEqual(state(status='stopped, sensor control paused')['status'],'stopped, sensor control paused')
+        self.assertEqual(parse('D,2,motor_command,Rejected command #42: stopped, retry manually')['message'],
+                         'Rejected command #42: stopped, retry manually')
+        self.assertEqual(parse('I,ego2sim firmware ready')['kind'],'I')
 
-    def test_command_limits(self):
-        for args in [(0,0,math.pi),(1,1,-2.),(1,2,-3.),(2,1,1.),(2,3,0)]:
-            validate_command(*args,LIMITS)
-        for args in [(0,1,1.),(2,2,1.),(1,0,1.),(0,0,4.),(1,2,11.),(2,1,7.),(9,3,0.),(0,3,math.nan)]:
-            with self.assertRaises(ValueError): validate_command(*args,LIMITS)
+    def test_malformed_packets_rejected(self):
+        for text in ('S,0,1','MS,0,3,0,0,1,0,0,0,0,0,0,0,idle','D,3,foo,bad',
+                     SAMPLE.replace('1.000','6.000'),SAMPLE.replace('1234','-1'),
+                     SAMPLE.replace('3528','inf'),'T,1,1,1,flex,0,5','X,1,123','MS,0'):
+            with self.subTest(text=text),self.assertRaises(ValueError):parse(text)
 
-    def test_dedup_ack_and_timeout_no_retry(self):
-        s = self.session()
-        wire = s.command(0,1,1,1.,0.)
-        self.assertIn(',0,1,1,1',wire)
-        with self.assertRaises(ValueError): s.command(0,1,1,1.,.1)
-        s.receive(parse(f'A,1,{s.token+1},0,1,OK'))
-        self.assertIn(0,s.pending)
-        s.receive(parse(f'A,1,{s.token},0,1,OK'))
-        self.assertNotIn(0,s.pending)
-        self.assertEqual(s.outcomes[-1],(0,'accepted:OK'))
-        s.command(1,2,1,.5,0.)
+    def test_uptime_wrap_and_restart(self):
+        t=UptimeTracker()
+        for ms in (0xfffffffe,0xffffffff,0,0,1,100):self.assertFalse(t.update(ms))
+        self.assertTrue(t.update(2))
+
+    def test_command_format_and_firmware_limits(self):
+        s=self.ready()
+        self.assertEqual(s.command(42,1,1,math.pi/2,0.),'C,42,1,1,1.57079633\n')
+        for args in ((0,0,math.pi),(1,1,20*math.pi),(1,2,100*math.tau/60),(2,1,-20*math.pi),(0,3,0)):
+            validate_command(*args)
+        for args in ((0,1,1),(2,2,1),(1,2,11),(2,1,63),(0,0,4),(1,1,math.nan)):
+            with self.assertRaises(ValueError):validate_command(*args)
+        with self.assertRaises(ValueError):s.command(42,1,1,1,0.)
+        with self.assertRaises(ValueError):s.command(0,0,3,0,0.)
+
+    def test_only_matching_motor_feedback_confirms_acceptance(self):
+        s=self.ready();s.command(42,1,1,1.,0.)
+        self.assertIn(42,s.pending)
+        s.receive(state(42,motor=0),.1)
+        self.assertIn(42,s.pending)
+        s.receive(state(42,motor=1),.2)
+        self.assertNotIn(42,s.pending)
+        self.assertEqual(s.outcomes[-1].result,'accepted')
+
+    def test_rejection_and_late_confirmation(self):
+        s=self.ready();s.command(42,1,1,1.,0.)
+        s.receive(parse('D,2,motor_command,Rejected command #42: motion commands need GUI mode'),.1)
+        self.assertEqual(s.outcomes[-1].result,'rejected')
+        s.command(43,1,1,1.,.2);s.expire(3.)
+        self.assertEqual(s.outcomes[-1].result,'unknown')
+        s.receive(state(43,ms=2000),3.1)
+        self.assertEqual(s.outcomes[-1].result,'accepted')
+
+    def test_no_replay_after_disconnect_or_boot(self):
+        s=self.ready();s.command(42,1,1,1.,0.)
+        s.reset(reason='unplugged')
+        self.assertFalse(s.ready);self.assertFalse(s.pending)
+        self.assertEqual(s.outcomes[-1].result,'unknown')
+        with self.assertRaises(ValueError):s.command(43,1,1,1.,0.)
+        s.reset(connected=True);s.receive(state(ms=20),.1)
+        with self.assertRaises(ValueError):s.command(42,1,1,1.,.1)
+        s.command(43,1,1,1.,.1)
+        self.assertTrue(s.receive(parse('I,ego2sim firmware ready'),.2))
+        self.assertFalse(s.ready);self.assertFalse(s.pending)
+        self.assertEqual(s.high_id,43)
+
+    def test_missed_banner_uptime_restart_and_stale_stop(self):
+        s=self.ready();s.command(42,1,1,1.,0.)
+        self.assertTrue(s.receive(state(ms=2),.1))
+        self.assertEqual(s.outcomes[-1].result,'unknown')
         s.expire(2.)
+        with self.assertRaises(ValueError):s.command(43,1,1,1.,2.)
+        self.assertEqual(s.command(43,1,3,0.,2.),'C,43,1,3,0\n')
+        s.receive(state(43,mode=1,ms=5),2.1)
+        with self.assertRaises(ValueError):s.command(44,1,1,1.,2.1)
+        self.assertEqual(s.command(44,1,3,0.,2.1),'C,44,1,3,0\n')
+
+    def test_bounds_pending_and_history(self):
+        s=self.ready()
+        for cid in range(1,65):s.command(cid,1,1,1.,0.)
+        with self.assertRaises(ValueError):s.command(65,1,1,1.,0.)
+        s.expire(3.)
         self.assertFalse(s.pending)
-        self.assertIn('not retried',s.outcomes[-1][1])
-        with self.assertRaises(ValueError): s.command(1,2,1,.5,2.)
-
-    def test_disconnect_restart_session_fence(self):
-        s = self.session()
-        old = s.token
-        s.command(42,1,1,1.,0.)
-        reply = s.receive(parse('B,1'))
-        self.assertTrue(reply.startswith('X,1,'))
-        self.assertFalse(s.ready)
-        self.assertFalse(s.pending)
-        s.receive(parse(f'H,1,{old},0,0,0'))
-        self.assertFalse(s.ready)
-        s.receive(parse(f'H,1,{s.token},0,0,0'))
-        with self.assertRaises(ValueError): s.command(42,1,1,1.,0.)
-        self.assertIn('unknown',s.outcomes[-1][1])
-
-    def test_sequence_wrap_and_acquisition_retention(self):
-        s = self.session()
-        s.receive(parse('T,1,4294967295,4294967295,flex,0,100'))
-        s.receive(parse('T,1,0,0,flex,0,101'))
-        self.assertEqual(s.acquisition_ms['flex'],0)
-        with self.assertRaises(ValueError): s.receive(parse('T,1,0,0,flex,0,101'))
-
-    def test_sensor_mode_stop_and_bound(self):
-        s = self.session()
-        s.receive(parse(f'H,1,{s.token},0,1,0'))
-        with self.assertRaises(ValueError): s.command(1,1,1,1.,0.)
-        s.command(1,1,3,0.,0.)
-        s.mode = 0
-        for cid in range(2,65): s.command(cid,1,1,1.,0.)
-        with self.assertRaises(ValueError): s.command(65,1,1,1.,0.)
-        s.expire(2.)
+        for cid in range(65,250):
+            s.receive(state(ms=2000+cid),float(cid))
+            s.command(cid,1,1,1.,float(cid));s.receive(state(cid,ms=2001+cid),float(cid))
+        self.assertLessEqual(len(s.issued),128)
         self.assertLessEqual(len(s.outcomes),64)
 
-class MockIntegrationTests(unittest.TestCase):
-    def test_wire_ack_relative_once_feedback_modes_watchdog(self):
-        clock = [10.]
-        with patch('ego2sim_backend.transport.time.monotonic',side_effect=lambda:clock[0]):
-            m = MockTransport(LIMITS)
-            s = Session(LIMITS)
-            m.poll()
-            m.send(1,s.reset())
-            for _,_,data in m.poll(): s.receive(parse(data.decode().strip()))
-            wire = s.command(10,2,1,.25,clock[0])
-            m.send(1,wire)
-            m.send(1,wire) # Firmware dedup independent of host dedup.
-            records = [parse(d.decode().strip()) for _,_,d in m.poll()]
-            self.assertEqual([r['accepted'] for r in records],[1,0])
-            for r in records: s.receive(r)
-            clock[0] += .5
-            records = [parse(d.decode().strip()) for _,_,d in m.poll()]
-            for r in records: s.receive(r)
-            state = [r for r in records if r['kind']=='S' and r['motor']==2][0]
-            self.assertEqual(state['position'],.25)
-            self.assertFalse(state['pm'])
-            self.assertEqual(state['last_id'],10)
-            self.assertEqual({r['sensor'] for r in records if r['kind']=='T'},set(('flex','ir','light','tof','ultrasonic')))
-            m.send(1,f'M,1,{s.token},1\n')
-            for _,_,d in m.poll(): s.receive(parse(d.decode().strip()))
-            self.assertEqual(s.mode,1)
-            with self.assertRaises(ValueError): s.command(11,1,2,1.,clock[0])
-            m.send(1,s.command(11,0,3,0.,clock[0]))
-            m.poll()
-            clock[0] += 2.
-            records = [parse(d.decode().strip()) for _,_,d in m.poll()]
-            states = [r for r in records if r['kind']=='S']
-            self.assertTrue(all(not r['moving'] and not r['enabled'] and r['watchdog'] for r in states))
+class TelemetryTests(unittest.TestCase):
+    def test_calibration_gate_and_pulse_width_units(self):
+        r=parse(SAMPLE)
+        v=sensor_values(r,{})
+        self.assertTrue(math.isnan(v['sensors/flex/angle']))
+        self.assertTrue(math.isnan(v['sensors/light/illuminance']))
+        self.assertTrue(math.isnan(v['sensors/ir/range']))
+        self.assertEqual(v['sensors/ultrasonic/raw_pulse_width'],3528)
+        self.assertNotIn('sensors/ultrasonic/raw_voltage',v)
+        v=sensor_values(r,dict(flex=True,light=True,ir=True))
+        self.assertEqual(v['sensors/flex/angle_filtered'],.3)
+        self.assertEqual(v['sensors/ir/range'],math.inf)
+        self.assertEqual(v['sensors/ir/range_filtered'],-math.inf)
+        self.assertAlmostEqual(sonar_pulse(3528),.6096)
 
-    def test_servo_stop_holds_commanded_angle(self):
-        m = MockTransport(LIMITS)
-        m.send(1,'X,1,99\n')
-        m.send(1,'C,1,99,1,0,0,1.2\n')
-        m.send(1,'C,1,99,2,0,3,0\n')
-        self.assertEqual(m.motors[0]['pos'],1.2)
-        self.assertTrue(m.motors[0]['enabled'])
-        m.send(1,'X,1,100\n')
-        self.assertEqual(m.motors[0]['pos'],1.2)
-        self.assertTrue(m.motors[0]['enabled'])
+class MockIntegrationTests(unittest.TestCase):
+    def test_wire_motion_ack_dedup_modes_and_stop_hold(self):
+        clock=[10.]
+        with patch('ego2sim_backend.transport.time.monotonic',side_effect=lambda:clock[0]):
+            m=MockTransport();s=Session()
+            def drain():
+                records=[]
+                for event,epoch,data in m.poll():
+                    if event=='connected':s.reset(connected=True)
+                    elif event=='data':
+                        r=parse(data.decode().strip());records.append(r);s.receive(r,clock[0])
+                return records
+            drain();self.assertFalse(s.ready)
+            clock[0]+=.1;drain();self.assertTrue(s.ready)
+            wire=s.command(42,2,1,.25,clock[0]);m.send(1,wire);m.send(1,wire)
+            clock[0]+=.2
+            records=drain();step=next(r for r in records if r['kind']=='MS' and r['motor']==2)
+            expected=round(.25/(math.tau/1600))*(math.tau/1600)
+            self.assertAlmostEqual(step['position'],expected,places=5)
+            self.assertFalse(step['pm']);self.assertEqual(step['last_id'],42)
+            self.assertEqual(s.outcomes[-1].result,'accepted')
+            m.send(1,'M,1\n');clock[0]+=.1;drain();self.assertEqual(s.mode,1)
+            m.send(1,s.command(43,2,3,0.,clock[0]));clock[0]+=.1;drain()
+            pos=m.motors[2]['pos'];clock[0]+=.5;drain()
+            self.assertEqual(m.motors[2]['pos'],pos)
+            self.assertTrue(m.motors[2]['held'])
+            m.send(1,'M,0\n');clock[0]+=.1;drain();self.assertFalse(m.motors[2]['held'])
 
 class SerialWorkerTests(unittest.TestCase):
     def test_reconnect_drops_previous_epoch_commands(self):
@@ -200,5 +224,6 @@ class SerialWorkerTests(unittest.TestCase):
                 while not written and time.monotonic()<deadline: time.sleep(.01)
                 self.assertEqual(written,[(1,b'NEW\n')])
             finally: transport.close()
+
 
 if __name__ == '__main__': unittest.main()

@@ -18,7 +18,7 @@ export const TOPICS = {
   irRange: t("sensors/ir/range"),
   irRangeFiltered: t("sensors/ir/range_filtered"),
   tofRange: t("sensors/tof/range"),
-  ultrasonicRawVoltage: t("sensors/ultrasonic/raw_voltage"),
+  ultrasonicRawPulseWidth: t("sensors/ultrasonic/raw_pulse_width"),
   ultrasonicRange: t("sensors/ultrasonic/range"),
   servoState: t("motors/servo/state"),
   dcState: t("motors/dc/state"),
@@ -63,7 +63,8 @@ export function modeName(mode: number): string {
   return mode === Mode.GUI ? "GUI" : mode === Mode.SENSOR ? "SENSOR" : `mode ${mode}`;
 }
 
-// Hardware limits shown in the GUI. The backend still enforces its own limits.
+// Limits match main/main.ino; the backend also enforces them.
+// Ultrasonic raw_pulse_width is microseconds. MS targets are absolute goals for relative moves.
 export const LIMITS = {
   servoMinDeg: 0,
   servoMaxDeg: 180,
