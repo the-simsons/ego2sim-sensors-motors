@@ -1,2 +1,8 @@
 #pragma once
-struct Servo { void attach(int){} void write(int){} };
+struct Servo {
+  bool on = false;
+  void attach(int) { on = true; }
+  void detach() { on = false; }
+  bool attached() const { return on; }
+  void write(int) {}
+};

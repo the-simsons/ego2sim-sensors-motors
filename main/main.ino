@@ -13,7 +13,8 @@
 //   A0  TEMT6000 ambient light SIG
 //   A1  Flex sensor divider (flex to 5 V, 10 k to GND)
 //   A2  Sharp IR rangefinder Vo
-//   A3  Pushbutton to GND (internal pull-up), toggles GUI/SENSOR mode
+//   A3  Pushbutton to GND (internal pull-up): kill switch, each press toggles killed/enabled
+//       (never use D0/D1 for buttons: they are the USB serial RX/TX lines)
 //   A4/A5  VL53L1X ToF (I2C SDA/SCL)
 //   D2/D3  DC motor encoder A/B (interrupts)
 //   D4/D5  EasyDriver MS1/MS2      D6 EasyDriver EN
@@ -49,6 +50,7 @@ const uint8_t PIN_DC_IN1 = 13;
 enum : uint8_t { MOTOR_SERVO = 0, MOTOR_DC = 1, MOTOR_STEPPER = 2, MOTOR_COUNT = 3 };
 enum : uint8_t { OP_POSITION_ABSOLUTE = 0, OP_MOVE_RELATIVE = 1, OP_VELOCITY = 2, OP_STOP = 3 };
 enum : uint8_t { MODE_GUI = 0, MODE_SENSOR = 1 };
+enum : uint8_t { KILL_SRC_BOOT = 0, KILL_SRC_BUTTON = 1, KILL_SRC_GUI = 2 };
 
 // ===================== Timing =====================
 const unsigned long SAMPLE_PERIOD_MS = 20;      // analog sensors at 50 Hz
@@ -57,7 +59,14 @@ const unsigned long SENSOR_CTRL_PERIOD_MS = 50; // sensor -> motor mapping at 20
 const unsigned long SENSOR_TX_PERIOD_MS = 50;   // "S" line at 20 Hz
 const unsigned long MOTOR_TX_PERIOD_MS = 100;   // "MS" lines at 10 Hz
 const unsigned long HEALTH_TX_PERIOD_MS = 2000; // "D" health lines
-const unsigned long DEBOUNCE_MS = 30;
+
+// ===================== Kill switch (A3 button + GUI) =====================
+// The button must read the same level for DEBOUNCE_MS before it counts. After a toggle,
+// further presses are ignored for KILL_LOCKOUT_MS, so a long, bouncy press/release
+// cannot toggle twice. Raise DEBOUNCE_MS if a single press still registers twice.
+const unsigned long DEBOUNCE_MS = 50;
+const unsigned long KILL_LOCKOUT_MS = 300;
+const bool START_KILLED = false;  // true = motors stay disabled after power-up until released
 
 // ===================== Sensor calibration =====================
 const float ADC_REF_V = 5.0;
@@ -173,6 +182,9 @@ void printNum(float v, uint8_t digits) {
 
 // ===================== Global state =====================
 uint8_t mode = MODE_GUI;
+bool killed = START_KILLED;
+uint8_t killSource = KILL_SRC_BOOT;
+bool killReportDue = true;  // send a KS line as soon as the TX queue has room
 
 struct MotorInfo {
   uint8_t op;
@@ -524,9 +536,34 @@ void setMode(uint8_t newMode) {
   sendDiag(0, F("control_mode"), mode == MODE_SENSOR ? F("SENSOR") : F("GUI"));
 }
 
+// Kill switch: stops every motor, releases the stepper driver, stops servo pulses and
+// rejects every motion command until released. Releasing leaves the motors stopped.
+void setKilled(bool on, uint8_t source) {
+  if (on == killed) return;
+  killed = on;
+  killSource = source;
+  killReportDue = true;
+  for (uint8_t m = 0; m < MOTOR_COUNT; m++) {
+    stopMotor(m);
+    motors[m].held = false;
+    setStatus(m, on ? F("killed") : F("kill switch released"));
+  }
+  sensorDcRpm = 0;
+  if (on) {
+    servo.detach();
+  } else {
+    servo.attach(PIN_SERVO);
+    servo.write((int)servoCmdDeg);
+  }
+  if (on) sendDiag(1, F("killswitch"), source == KILL_SRC_BUTTON ? F("ENGAGED by button") : F("ENGAGED by GUI"));
+  else sendDiag(0, F("killswitch"), source == KILL_SRC_BUTTON ? F("released by button") : F("released by GUI"));
+}
+
+// Time-based debounce: a new level must hold for DEBOUNCE_MS before it is accepted,
+// so contact bounce on press and on release is ignored. Only the press edge toggles.
 void updateButton(unsigned long now) {
   static bool lastReading = HIGH, stable = HIGH;
-  static unsigned long lastChange = 0;
+  static unsigned long lastChange = 0, lastToggle = 0 - KILL_LOCKOUT_MS;  // first press always counts
   bool reading = digitalRead(PIN_BUTTON);
   if (reading != lastReading) {
     lastReading = reading;
@@ -534,7 +571,10 @@ void updateButton(unsigned long now) {
   }
   if (now - lastChange >= DEBOUNCE_MS && reading != stable) {
     stable = reading;
-    if (stable == LOW) setMode(mode == MODE_GUI ? MODE_SENSOR : MODE_GUI);  // on press
+    if (stable == LOW && now - lastToggle >= KILL_LOCKOUT_MS) {
+      lastToggle = now;
+      setKilled(!killed, KILL_SRC_BUTTON);
+    }
   }
 }
 
@@ -604,6 +644,7 @@ void handleMotorCommand(uint32_t id, uint8_t m, uint8_t op, float target) {
     }
     return;
   }
+  if (killed) return reject(id, F("kill switch engaged"));
   if (mode != MODE_GUI) return reject(id, F("motion commands need GUI mode"));
 
   float deg = target * RAD_TO_DEG;
@@ -638,7 +679,7 @@ void handleMotorCommand(uint32_t id, uint8_t m, uint8_t op, float target) {
   motors[m].lastCommandId = id;
 }
 
-// Lines: "C,<id>,<motor>,<op>,<target>"  "M,<mode>"  "Z"  "K,<counts>"  "P"
+// Lines: "C,<id>,<motor>,<op>,<target>"  "M,<mode>"  "X,<killed>"  "Z"  "K,<counts>"  "P"
 void handleLine(char* line) {
   char* fields[5];
   uint8_t n = 0;
@@ -654,6 +695,10 @@ void handleLine(char* line) {
       break;
     case 'M':
       if (n == 2) setMode(atoi(fields[1]) == MODE_SENSOR ? MODE_SENSOR : MODE_GUI);
+      break;
+    case 'X':  // GUI kill switch: 1 = kill, 0 = release
+      if (n == 2) setKilled(atoi(fields[1]) != 0, KILL_SRC_GUI);
+      else killReportDue = true;
       break;
     case 'Z':
       noInterrupts();
@@ -773,7 +818,7 @@ bool sendMotor(unsigned long now, uint8_t m) {
   tx.print(',');
   tx.print(motors[m].op);
   tx.print(',');
-  tx.print(motors[m].held ? 0 : 1);
+  tx.print(motors[m].held || killed ? 0 : 1);
   tx.print(',');
   tx.print(moving ? 1 : 0);
   tx.print(',');
@@ -789,13 +834,30 @@ bool sendMotor(unsigned long now, uint8_t m) {
   tx.print(',');
   tx.print(motors[m].lastCommandId);
   tx.print(',');
-  tx.print(motors[m].status);
-  if (!isnan(motors[m].statusDeg)) {
+  if (killed) {
+    tx.print(F("killed"));
+  } else {
+    tx.print(motors[m].status);
+  }
+  if (!killed && !isnan(motors[m].statusDeg)) {
     tx.print(' ');
     tx.print(motors[m].statusDeg, 3);
     tx.print(F(" deg"));
   }
   tx.println();
+  return true;
+}
+
+// KS,<ms>,<killed>,<source>   source = boot | button | gui (who last changed it)
+bool sendKill(unsigned long now) {
+  if (tx.room() < 2 * TX_LINE_MAX) return false;
+  tx.print(F("KS,"));
+  tx.print(now);
+  tx.print(',');
+  tx.print(killed ? 1 : 0);
+  tx.print(',');
+  tx.println(killSource == KILL_SRC_BUTTON ? F("button") : killSource == KILL_SRC_GUI ? F("gui") : F("boot"));
+  killReportDue = false;
   return true;
 }
 
@@ -840,9 +902,11 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), encoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), encoderISR, CHANGE);
 
-  servo.attach(PIN_SERVO);
-  servoSet(90);
-  servoEstDeg = 90;
+  servoCmdDeg = servoEstDeg = 90;
+  if (!killed) {
+    servo.attach(PIN_SERVO);
+    servoSet(90);
+  }
 
   // MaxSonar PW on D10 = PB2 = PCINT2 (pin-change interrupt group 0).
   pinMode(PIN_SONAR_PW, INPUT);
@@ -869,6 +933,8 @@ void setup() {
   tx.println(F("I,ego2sim firmware ready"));
   sendHealth();
   tx.drain();
+  sendKill(millis());
+  tx.drain();
 
   unsigned long now = millis();
   dcLastCtrl = now;
@@ -879,7 +945,7 @@ void setup() {
 void loop() {
   static unsigned long lastSample = 0, lastTof = 0, lastSensorCtrl = 0;
   static unsigned long lastSensorTx = 0, lastMotorTx = 0, lastHealth = 0;
-  static uint8_t nextMotorTx = MOTOR_COUNT;
+  static uint8_t nextMotorTx = MOTOR_COUNT + 1;  // 0..2 = MS lines, 3 = KS, 4 = idle
 
   unsigned long now = millis();
 
@@ -900,16 +966,21 @@ void loop() {
   }
   updateSonar(now);
 
-  if (mode == MODE_SENSOR && now - lastSensorCtrl >= SENSOR_CTRL_PERIOD_MS) {
+  if (!killed && mode == MODE_SENSOR && now - lastSensorCtrl >= SENSOR_CTRL_PERIOD_MS) {
     lastSensorCtrl = now;
     applySensorControl();
   }
 
   // Telemetry: one line per loop at most, so no single loop pass does much printing.
-  if (now - lastSensorTx >= SENSOR_TX_PERIOD_MS) {
+  // A kill switch change is reported first; KS also repeats after every MS cycle (10 Hz).
+  if (killReportDue) {
+    sendKill(now);
+  } else if (now - lastSensorTx >= SENSOR_TX_PERIOD_MS) {
     if (sendSensors(now)) lastSensorTx = now;
   } else if (nextMotorTx < MOTOR_COUNT) {
     if (sendMotor(now, nextMotorTx)) nextMotorTx++;
+  } else if (nextMotorTx == MOTOR_COUNT) {
+    if (sendKill(now)) nextMotorTx++;
   } else if (now - lastMotorTx >= MOTOR_TX_PERIOD_MS) {
     lastMotorTx = now;
     nextMotorTx = 0;

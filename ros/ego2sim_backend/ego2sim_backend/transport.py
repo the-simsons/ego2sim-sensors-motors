@@ -84,7 +84,7 @@ class SerialTransport:
 
 
 class MockTransport:
-    """Simulated sensors/motion; same C/M inputs and S/MS/D/I outputs as firmware.
+    """Simulated sensors/motion; same C/M/X inputs and S/MS/KS/D/I outputs as firmware.
 
     No hardware watchdog, version handshake or command ACK is invented.
     """
@@ -93,6 +93,7 @@ class MockTransport:
         self.events = [('connected',1,'')]
         self.start = self.last = time.monotonic()
         self.epoch,self.mode = 1,0
+        self.killed,self.kill_source = False,'boot'
         self.seen_ids = []
         self.motors = [dict(pos=math.pi/2 if i==0 else 0.,vel=0.,target=math.pi/2 if i==0 else 0.,
             op=3,last_id=0,held=False,status='SIMULATED idle') for i in range(3)]
@@ -122,6 +123,15 @@ class MockTransport:
                     self.stop_motor(i)
                     m.update(held=False,status='SIMULATED mode changed')
                 self.emit('D,0,control_mode,'+('SENSOR' if mode else 'GUI'))
+        elif p[0] == 'X' and len(p) == 2:
+            killed = p[1] != '0'
+            if killed != self.killed:
+                self.killed,self.kill_source = killed,'gui'
+                for i,m in enumerate(self.motors):
+                    self.stop_motor(i)
+                    m.update(held=False,status='SIMULATED killed' if killed else 'SIMULATED kill switch released')
+                self.emit('D,1,killswitch,ENGAGED by GUI' if killed else 'D,0,killswitch,released by GUI')
+            self.emit(f'KS,{self.ms()},{int(self.killed)},{self.kill_source}')
         elif p[0] == 'C' and len(p) == 5:
             cid,motor,op = map(int,p[1:4])
             target = float(p[4])
@@ -131,6 +141,8 @@ class MockTransport:
             self.seen_ids = (self.seen_ids+[cid])[-8:]
             try:
                 validate_command(motor,op,target,self.limits)
+                if self.killed and op != 3:
+                    raise ValueError('kill switch engaged')
                 if self.mode and op != 3:
                     raise ValueError('motion commands need GUI mode')
                 m = self.motors[motor]
@@ -164,7 +176,7 @@ class MockTransport:
             ir,tof = .7+.4*math.sin(t*.5),.6+.3*math.sin(t*.4)
             self.emit(f'S,{self.ms()},500,{flex:.4f},{flex:.4f},1.000,200.0,200.0,1.200,'
                       f'{ir:.4f},{ir:.4f},{tof:.4f},3528,0.6096')
-            if self.mode == 1:
+            if self.mode == 1 and not self.killed:
                 servo,dc,step = self.motors
                 if not servo['held']:
                     goal = min(math.pi,max(0.,2*flex))
@@ -188,9 +200,11 @@ class MockTransport:
                     m['vel'] = delta/dt
                 else:
                     m['vel'] = 0.
-                self.emit(f'MS,{self.ms()},{i},{self.mode},{m["op"]},{int(not m["held"])},'
+                self.emit(f'MS,{self.ms()},{i},{self.mode},{m["op"]},{int(not (m["held"] or self.killed))},'
                           f'{int(abs(m["vel"])>1e-6)},{m["pos"]:.6f},{m["vel"]:.6f},'
-                          f'{m["target"]:.6f},0,0,{m["last_id"]},{m["status"]}')
+                          f'{m["target"]:.6f},0,0,{m["last_id"]},'
+                          f'{"SIMULATED killed" if self.killed else m["status"]}')
+            self.emit(f'KS,{self.ms()},{int(self.killed)},{self.kill_source}')
         events,self.events = self.events,[]
         return events
 

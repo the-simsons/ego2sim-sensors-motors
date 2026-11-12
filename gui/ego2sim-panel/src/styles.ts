@@ -75,4 +75,14 @@ export const PANEL_CSS = `
 .e2s-table td { padding: 3px 6px 3px 0; border-top: 1px solid var(--border); }
 .e2s-diag { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; padding: 3px 0; }
 .e2s-diag-name { font-weight: 600; }
+.e2s-kill { display: flex; gap: 12px; align-items: center; justify-content: space-between;
+  padding: 10px 12px; margin-bottom: 10px; border-radius: 8px; border: 2px solid; }
+.e2s-kill.armed { border-color: var(--ok); }
+.e2s-kill.killed { border-color: var(--error); background: color-mix(in srgb, var(--error) 15%, transparent); }
+.e2s-kill-state { font-size: 16px; font-weight: 700; }
+.e2s-kill.armed .e2s-kill-state { color: var(--ok); }
+.e2s-kill.killed .e2s-kill-state { color: var(--error); }
+.e2s .e2s-kill-btn { padding: 10px 22px; font-weight: 800; font-size: 15px; color: #fff; }
+.e2s .e2s-kill-btn.kill { background: var(--error); border-color: var(--error); }
+.e2s .e2s-kill-btn.release { background: var(--ok); border-color: var(--ok); }
 `;

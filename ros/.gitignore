@@ -5,3 +5,11 @@ build/
 install/
 log/
 *.egg-info/
+.vscode/
+build/
+button_test/
+gui/ego2sim-panel/CHANGELOG.md
+install/
+log/
+
+

@@ -37,7 +37,8 @@ inline unsigned long micros(){return fakeMicros;}
 inline void delayMicroseconds(unsigned int us){fakeMicros+=us;}
 inline void noInterrupts(){} inline void interrupts(){}
 inline void pinMode(int,int){} inline void digitalWrite(int,int){}
-inline int digitalRead(int){return 0;}
+inline int fakeButton=1;  // A3 kill switch: 1 = released (pull-up), 0 = pressed
+inline int digitalRead(int p){return p==A3?fakeButton:0;}
 inline int analogRead(int){return 500;}
 inline void analogWrite(int,int){}
 inline int digitalPinToInterrupt(int p){return p;}

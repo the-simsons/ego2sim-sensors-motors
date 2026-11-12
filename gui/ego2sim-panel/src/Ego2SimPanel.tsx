@@ -12,6 +12,7 @@ import { createRoot } from "react-dom/client";
 
 import {
   ACK_TIMEOUT_MS,
+  Bool,
   ControlMode,
   DiagnosticArray,
   DiagnosticStatus,
@@ -54,7 +55,8 @@ type CommandOutcome = { result: "accepted" | "rejected" | "unknown"; detail: str
 type LoggedDiagnostic = DiagnosticStatus & { receivedAt: number };
 
 const SUBSCRIBED_TOPICS = Object.values(TOPICS).filter(
-  (topic) => topic !== TOPICS.motorCommand && topic !== TOPICS.modeCommand,
+  (topic) =>
+    topic !== TOPICS.motorCommand && topic !== TOPICS.modeCommand && topic !== TOPICS.killCommand,
 );
 
 const MOTOR_STATE_TOPICS: Record<Motor, string> = {
@@ -181,9 +183,13 @@ function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactEle
     context.advertise?.(TOPICS.modeCommand, SCHEMAS.controlMode, {
       datatypes: PUBLISH_DATATYPES,
     });
+    context.advertise?.(TOPICS.killCommand, SCHEMAS.bool, {
+      datatypes: PUBLISH_DATATYPES,
+    });
     return () => {
       context.unadvertise?.(TOPICS.motorCommand);
       context.unadvertise?.(TOPICS.modeCommand);
+      context.unadvertise?.(TOPICS.killCommand);
     };
   }, [context]);
 
@@ -210,6 +216,10 @@ function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactEle
       return;
     }
     const feedback = motorState(motor);
+    if (operation !== Operation.STOP && killed !== false) {
+      setError("Kill switch engaged (or state unknown): only STOP is allowed.");
+      return;
+    }
     if (operation !== Operation.STOP &&
         (!feedback || feedback.stale || feedback.message.control_mode !== Mode.GUI)) {
       setError("Motion requires fresh motor feedback in GUI mode.");
@@ -252,6 +262,19 @@ function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactEle
     }
   };
 
+  const sendKill = (message: Bool) => {
+    if (!context.publish) {
+      setError("This data source does not accept commands. Connect with Foxglove WebSocket.");
+      return;
+    }
+    try {
+      context.publish(TOPICS.killCommand, message);
+      setError(undefined);
+    } catch (err) {
+      setError(`Publish failed: ${String(err)}`);
+    }
+  };
+
   // Actual mode comes from motor feedback, never from what the GUI last sent.
   const reportedModes = [Motor.SERVO, Motor.DC, Motor.STEPPER]
     .map((motor) => motorState(motor))
@@ -264,7 +287,10 @@ function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactEle
         ? reportedModes[0]
         : "mixed";
   const modePending = requestedMode != undefined && actualMode !== requestedMode;
-  const guiControl = actualMode === Mode.GUI;
+  // Kill state comes only from firmware (KS lines); undefined = unknown or stale.
+  const killEntry = get(TOPICS.killState) as Got<Bool>;
+  const killed = killEntry && !killEntry.stale ? killEntry.message.data : undefined;
+  const guiControl = actualMode === Mode.GUI && killed === false;
 
   const lastSent = (motor: Motor) => sent.find((command) => command.motor === motor);
 
@@ -321,6 +347,28 @@ function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactEle
           </span>
         </div>
       </header>
+
+      <div className={`e2s-kill ${killed === false ? "armed" : "killed"}`}>
+        <div>
+          <div className="e2s-kill-state">
+            {killed == undefined ? "KILL SWITCH: UNKNOWN" : killed ? "MOTORS KILLED" : "MOTORS ENABLED"}
+          </div>
+          <div className="e2s-small">
+            {killed == undefined
+              ? "No kill switch state from the firmware. Motion is locked."
+              : "The A3 button and this switch both toggle it."}
+          </div>
+        </div>
+        {killed === true ? (
+          <button className="e2s-kill-btn release" onClick={() => { sendKill({ data: false }); }}>
+            RE-ENABLE
+          </button>
+        ) : (
+          <button className="e2s-kill-btn kill" onClick={() => { sendKill({ data: true }); }}>
+            KILL
+          </button>
+        )}
+      </div>
 
       {error && <div className="e2s-banner error">{error}</div>}
       {!context.publish && (

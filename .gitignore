@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+install/
+log/
+*.egg-info/
+.vscode/
+build/
+button_test/
+gui/ego2sim-panel/CHANGELOG.md
+install/
+log/
+
+

@@ -17,7 +17,7 @@ Build it with the Servo library (built in) and the VL53L1X library above.
 | A0 | TEMT6000 ambient light SIG |
 | A1 | Flex sensor divider (flex to 5 V, 10 kΩ to GND) |
 | A2 | Sharp IR Vo |
-| A3 | Pushbutton to GND (internal pull-up). Debounced; each press toggles GUI/SENSOR mode |
+| A3 | Pushbutton to GND (internal pull-up). **Kill switch**: each press toggles killed/enabled (50 ms debounce, 300 ms lockout). Never wire buttons to D0/D1 (USB serial) |
 | A4 / A5 | VL53L1X SDA / SCL |
 | D2 / D3 | DC encoder A / B |
 | D4, D5, D6, D7, D8 | EasyDriver MS1, MS2, EN, STEP, DIR (1/8 microstep) |
@@ -33,8 +33,9 @@ Build it with the Servo library (built in) and the VL53L1X library above.
 | Sharp IR (filtered) | DC motor | < 0.5 m: −50 RPM; > 0.9 m or nothing in range: +50 RPM; stop in between |
 | VL53L1X ToF | Stepper | 0.1–1.0 m → 0–360° from the power-up position, 5° deadband |
 
-The TEMT6000 and MaxSonar are reported only. Changing mode (button or GUI) stops all
-motors. In SENSOR mode, GUI motion commands are rejected. STOP still works and pauses
+The TEMT6000 and MaxSonar are reported only. Changing mode (GUI) stops all motors.
+The kill switch (A3 button or the panel's KILL button) stops all motors, releases the
+stepper, stops servo pulses and rejects every motion command until it is released. In SENSOR mode, GUI motion commands are rejected. STOP still works and pauses
 sensor control of that motor until the mode changes again.
 
 ### Serial protocol (115200 baud, one comma-separated ASCII line each, `\n`-terminated)
@@ -50,6 +51,7 @@ Uno → laptop:
 | `S` (20 Hz) | `S,ms,flex_adc,flex_rad,flex_rad_f,light_v,lux,lux_f,ir_v,ir_m,ir_m_f,tof_m,sonar_pulse_us,sonar_m` |
 | `MS` (10 Hz per motor) | `MS,ms,motor,mode,op,enabled,moving,pos_rad,vel_rad_s,target,pos_measured,vel_measured,last_command_id,status` |
 | `D` | `D,level,name,message` (0 OK / 1 WARN / 2 ERROR). Rejected commands use `name=motor_command` |
+| `KS` (10 Hz + on change) | `KS,ms,killed,source` (killed 0/1; source `boot`/`button`/`gui`) → ROS `/ego2sim/control/kill_state` (`std_msgs/Bool`) |
 | `I` | `I,text` (boot banner, `P` reply) |
 
 `motor`, `op`, and `mode` use the numbers in `gui/ego2sim-panel/src/contract.ts`.
@@ -62,6 +64,7 @@ Laptop → Uno:
 |---|---|
 | `C,id,motor,op,target` | `MotorCommand`, passed through unchanged (target in rad or rad/s) |
 | `M,mode` | `ControlMode` (0 = GUI, 1 = SENSOR) |
+| `X,killed` | Kill switch from ROS `/ego2sim/control/kill_command` (`std_msgs/Bool`): 1 = kill, 0 = release |
 | `Z` | Zero the DC encoder |
 | `K,counts` | Set DC encoder counts per output revolution |
 | `P` | Print the encoder count and counts per revolution |

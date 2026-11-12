@@ -14,6 +14,7 @@ SENSOR_FIELDS = ('flex_adc','flex_rad','flex_rad_f','light_v','lux','lux_f',
 FIRMWARE_LIMITS = dict(servo_min=0., servo_max=math.pi,
                        move_max=20*math.pi, velocity_max=100*math.tau/60)
 BOOT = 'ego2sim firmware ready'
+KILL_SOURCES = ('boot', 'button', 'gui')
 REJECTION = re.compile(r'^Rejected command #(\d+): (.*)$')
 
 
@@ -87,6 +88,11 @@ def parse(line):
         if len(p) != 4 or not p[2] or not p[3]:
             raise ValueError('Malformed diagnostic')
         return dict(kind=kind, level=integer(p[1],2), name=p[2], message=p[3])
+    if kind == 'KS':
+        p = line.split(',')
+        if len(p) != 4 or p[3] not in KILL_SOURCES:
+            raise ValueError('KS needs ms, killed and boot/button/gui source')
+        return dict(kind=kind, ms=integer(p[1]), killed=bool(integer(p[2],1)), source=p[3])
     if kind == 'I' and ',' in line:
         return dict(kind=kind, message=line.split(',',1)[1])
     raise ValueError('Unknown firmware record')
@@ -141,6 +147,8 @@ class Session:
         self.connected = False
         self.ready = False
         self.mode = None
+        self.killed = None  # None until the firmware reports a KS line
+        self.kill_source = None
         self.motor_seen = {}
         self.uptime = UptimeTracker()
         self.acquisition_ms = {}
@@ -151,6 +159,7 @@ class Session:
             self.outcomes.append(Outcome(cid,pending['motor'],'unknown',reason+'; not retried'))
         self.pending.clear()
         self.connected, self.ready, self.mode = connected, False, None
+        self.killed = self.kill_source = None
         self.motor_seen.clear()
         self.acquisition_ms.clear()
         self.uptime = UptimeTracker()
@@ -176,6 +185,8 @@ class Session:
                 self.outcomes.append(Outcome(cid,record['motor'],'accepted','confirmed by firmware MS'))
         elif k == 'S':
             self.acquisition_ms['sensors'] = record['ms']
+        elif k == 'KS' and self.connected:
+            self.killed, self.kill_source = record['killed'], record['source']
         elif k == 'D' and record['name'] == 'motor_command':
             match = REJECTION.fullmatch(record['message'])
             if match:
@@ -196,6 +207,8 @@ class Session:
         if operation != 3:
             if not self.ready or now-self.motor_seen.get(motor,-math.inf) > self.stale_timeout:
                 raise ValueError('No fresh firmware feedback for this motor')
+            if self.killed:
+                raise ValueError('Kill switch engaged; only STOP is accepted')
             if self.mode != 0:
                 raise ValueError('Motion commands require reported GUI mode')
         if len(self.pending) >= 64:
@@ -210,6 +223,12 @@ class Session:
             oldest = next(k for k in self.issued if k not in self.pending)
             self.issued.pop(oldest)
         return line
+
+    def kill_command(self, killed):
+        """Kill switch request; the firmware's KS line confirms the actual state."""
+        if not self.connected:
+            raise ValueError('Serial disconnected')
+        return f'X,{int(bool(killed))}\n'
 
     def expire(self, now):
         for cid,pending in list(self.pending.items()):

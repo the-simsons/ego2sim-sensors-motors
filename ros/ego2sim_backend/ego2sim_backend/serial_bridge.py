@@ -7,6 +7,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from sensor_msgs.msg import Illuminance, Range
+from std_msgs.msg import Bool
 from ego2sim_interfaces.msg import ScalarStamped, MotorCommand, MotorState, ControlMode
 from .protocol import Framer, Session, FIRMWARE_LIMITS, Outcome, parse, NAN
 from .telemetry import SENSOR_TOPICS, RAW_TOPICS, sensor_values
@@ -56,6 +57,9 @@ class SerialBridge(Node):
         self.diag = self.create_publisher(DiagnosticArray,'diagnostics',qos())
         self.create_subscription(MotorCommand,'motors/command',self.command,qos())
         self.create_subscription(ControlMode,'control/mode_command',self.mode_command,qos())
+        # Kill switch: True = all motors killed. State comes only from firmware KS lines.
+        self.kill_pub = self.create_publisher(Bool,'control/kill_state',qos())
+        self.create_subscription(Bool,'control/kill_command',self.kill_command,qos())
         self.session = Session(limits,ack_timeout,self.stale)
         self.transport = MockTransport(limits) if self.mock else SerialTransport(param('port','/dev/ttyACM0'))
         self.framer,self.epoch = Framer(),None
@@ -79,7 +83,7 @@ class SerialBridge(Node):
     def command_result(self,outcome):
         d = DiagnosticStatus()
         d.name,d.hardware_id = 'ego2sim/command','mock' if self.mock else 'arduino'
-        d.level = 0 if outcome.result=='accepted' else 2 if outcome.result=='rejected' else 1
+        d.level = bytes([0 if outcome.result=='accepted' else 2 if outcome.result=='rejected' else 1])
         d.message = f'Command #{outcome.command_id} {outcome.result}: {outcome.detail}'
         d.values = [KeyValue(key=k,value=str(v)) for k,v in dict(command_id=outcome.command_id,
                     motor=outcome.motor,result=outcome.result).items()]
@@ -110,6 +114,14 @@ class SerialBridge(Node):
             self.mode_request = f'requested {msg.mode}; awaiting MS feedback'
         except ValueError as exc:
             self.last_error = str(exc)
+
+    def kill_command(self,msg):
+        try:
+            self.send(self.session.kill_command(msg.data))
+            self.get_logger().warn('Kill switch %s requested from ROS' % ('ENGAGE' if msg.data else 'RELEASE'))
+        except ValueError as exc:
+            self.last_error = str(exc)
+            self.get_logger().error(f'Kill switch request not sent: {exc}')
 
     def publish_sensor(self,topic,value,stamp):
         kind,field,_ = SENSOR_TOPICS[topic]
@@ -163,9 +175,11 @@ class SerialBridge(Node):
             self.motor_cache[r['motor']] = msg
             self.motor_pubs[r['motor']].publish(msg)
             self.mode_request = f'actual {r["mode"]} from firmware MS'
+        elif r['kind']=='KS':
+            self.kill_pub.publish(Bool(data=r['killed']))
         elif r['kind']=='D':
             d = DiagnosticStatus()
-            d.name,d.hardware_id,d.level,d.message = 'firmware/'+r['name'],'arduino',r['level'],r['message']
+            d.name,d.hardware_id,d.level,d.message = 'firmware/'+r['name'],'arduino',bytes([r['level']]),r['message']
             # Bound distinct firmware diagnostic names.
             if d.name not in self.firmware_diags and len(self.firmware_diags)>=32:
                 self.firmware_diags.pop(next(iter(self.firmware_diags)))
@@ -212,22 +226,28 @@ class SerialBridge(Node):
             stale_motors = [i for i in range(3) if now-self.session.motor_seen.get(i,-math.inf)>self.stale]
             for i in stale_motors: self.unavailable_motor(i)
             d = DiagnosticStatus(); d.name='ego2sim/serial_bridge'; d.hardware_id='mock' if self.mock else 'arduino'
-            d.level = 2 if self.epoch is None or stale_motors or sensors_stale else 0
+            d.level = bytes([2 if self.epoch is None or stale_motors or sensors_stale else 0])
             d.message = 'Serial disconnected' if self.epoch is None else 'Stale telemetry' if stale_motors or sensors_stale else 'Firmware telemetry active'
-            details = dict(protocol='Arduino S/MS/D/I; C/M commands',last_error=self.last_error,
+            details = dict(protocol='Arduino S/MS/KS/D/I; C/M/X commands',last_error=self.last_error,
                 parse_errors=self.errors,framing_errors=self.framer.errors+getattr(self.transport,'framing_errors',0),
-                restarts=self.restarts,mode=self.session.mode,mode_request=self.mode_request,
+                restarts=self.restarts,mode=self.session.mode,killed=self.session.killed,mode_request=self.mode_request,
                 pending=len(self.session.pending),stale_motors=stale_motors,
                 acquisition_ms=self.session.acquisition_ms,rx_dropped=getattr(self.transport,'dropped',0))
             d.values=[KeyValue(key=k,value=str(v)) for k,v in details.items()]
             cal = DiagnosticStatus(); cal.name='ego2sim/calibration'; cal.hardware_id=d.hardware_id
             missing=[s for s,verified in self.calibration.items() if not verified]
-            cal.level=1 if missing and self.processed else 0
+            cal.level=bytes([1 if missing and self.processed else 0])
             cal.message=('Unverified firmware calibration: '+','.join(missing)+'; physical values suppressed') if missing and self.processed else 'Firmware calibration marked verified' if self.processed else 'Host processing selected'
+            kill = DiagnosticStatus(); kill.name='ego2sim/killswitch'; kill.hardware_id=d.hardware_id
+            killed = self.session.killed
+            kill.level = bytes([0 if killed is False else 1 if killed else 2])
+            kill.message = ('Motors enabled' if killed is False else
+                            f'KILLED (last changed by {self.session.kill_source})' if killed else
+                            'Kill switch state unknown (no KS from firmware)')
             link = DiagnosticStatus(); link.name='ego2sim/firmware_limits'; link.hardware_id=d.hardware_id
-            link.level=1; link.message='Firmware has no link-loss watchdog; process/USB loss cannot guarantee motor stop'
+            link.level=bytes([1]); link.message='Firmware has no link-loss watchdog; process/USB loss cannot guarantee motor stop'
             link.values=[KeyValue(key='retry_policy',value='No command replay; MS confirms only last accepted ID')]
-            self.publish_diagnostics([d,cal,link,*self.firmware_diags.values()])
+            self.publish_diagnostics([d,kill,cal,link,*self.firmware_diags.values()])
 
     def destroy_node(self):
         self.transport.close()

@@ -26,11 +26,14 @@ export const TOPICS = {
   diagnostics: t("diagnostics"),
   motorCommand: t("motors/command"),
   modeCommand: t("control/mode_command"),
+  killState: t("control/kill_state"),
+  killCommand: t("control/kill_command"),
 } as const;
 
 export const SCHEMAS = {
   motorCommand: "ego2sim_interfaces/msg/MotorCommand",
   controlMode: "ego2sim_interfaces/msg/ControlMode",
+  bool: "std_msgs/msg/Bool",
 } as const;
 
 export const Motor = { SERVO: 0, DC: 1, STEPPER: 2 } as const;
@@ -128,6 +131,8 @@ export type MotorCommand = {
   target: number;
 };
 export type ControlMode = { mode: Mode };
+// Kill switch: true = all motors killed (A3 button or GUI).
+export type Bool = { data: boolean };
 
 // Message definitions handed to Foxglove so it can CDR-encode what the panel
 // publishes, even before the backend advertises these types.
@@ -151,6 +156,13 @@ export const PUBLISH_DATATYPES = new Map([
     {
       name: SCHEMAS.controlMode,
       definitions: [field("mode", "uint8")],
+    },
+  ],
+  [
+    SCHEMAS.bool,
+    {
+      name: SCHEMAS.bool,
+      definitions: [field("data", "bool")],
     },
   ],
 ]);

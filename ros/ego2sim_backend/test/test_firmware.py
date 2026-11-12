@@ -21,7 +21,7 @@ class FirmwareTests(unittest.TestCase):
             run=subprocess.run([binary],capture_output=True,text=True)
             self.assertEqual(run.returncode,0,run.stderr)
             records=[parse(line) for line in run.stdout.splitlines()]
-            self.assertEqual({r['kind'] for r in records},{'S','MS','D','I'})
+            self.assertEqual({r['kind'] for r in records},{'S','MS','D','I','KS'})
             sensors=next(r for r in records if r['kind']=='S')
             self.assertEqual(sensors['sonar_pulse_us'],3528)
             self.assertAlmostEqual(sensors['sonar_m'],.6096)
