@@ -30,8 +30,8 @@ const DEFS = {
     "float32 field_of_view\nfloat32 min_range\nfloat32 max_range\nfloat32 range",
   "sensor_msgs/msg/Illuminance": "std_msgs/Header header\nfloat64 illuminance\nfloat64 variance",
   "ego2sim_interfaces/msg/MotorState":
-    "std_msgs/Header header\nuint8 motor\nuint8 control_mode\nuint8 operation\nbool enabled\n" +
-    "bool moving\nfloat64 position_rad\nfloat64 velocity_rad_s\nfloat64 target\n" +
+    "std_msgs/Header header\nuint8 motor\nuint8 control_mode\nbool enabled\nbool moving\n" +
+    "float64 position_rad\nfloat64 velocity_rad_s\nuint8 operation\nfloat64 target\n" +
     "bool position_measured\nbool velocity_measured\nuint32 last_command_id\nstring status",
   "diagnostic_msgs/msg/KeyValue": "string key\nstring value",
   "diagnostic_msgs/msg/DiagnosticStatus":
@@ -106,7 +106,7 @@ for (const [suffix, type] of [
   ["sensors/ir/range", RANGE],
   ["sensors/ir/range_filtered", RANGE],
   ["sensors/tof/range", RANGE],
-  ["sensors/ultrasonic/raw_voltage", SCALAR],
+  ["sensors/ultrasonic/raw_pulse_width", SCALAR],
   ["sensors/ultrasonic/range", RANGE],
   ["motors/servo/state", "ego2sim_interfaces/msg/MotorState"],
   ["motors/dc/state", "ego2sim_interfaces/msg/MotorState"],
@@ -132,8 +132,8 @@ const OP = { POSITION_ABSOLUTE: 0, MOVE_RELATIVE: 1, VELOCITY: 2, STOP: 3 };
 const MODE = { GUI: 0, SENSOR: 1 };
 const DEG = Math.PI / 180;
 const STEP_RAD = (360 / 1600) * DEG; // 1/8 microstepping, 200 steps/rev
-const SERVO_SPEED = 315 * DEG; // HS-311 ~0.19 s / 60 deg
-const STEPPER_SPEED = 180 * DEG;
+const SERVO_SPEED = 300 * DEG; // HS-311 ~0.19 s / 60 deg
+const STEPPER_SPEED = 225 * DEG;
 const DC_MAX_SPEED = 100 * ((2 * Math.PI) / 60); // 100 RPM
 
 let mode = MODE.GUI;
@@ -149,14 +149,16 @@ const makeMotor = (motor, position) => ({
   velocity: 0,
   target: position,
   lastCommandId: 0,
-  status: "idle",
+  status: "SIMULATED idle",
+  held: false,
 });
 const motors = [makeMotor(MOTOR.SERVO, 90 * DEG), makeMotor(MOTOR.DC, 0), makeMotor(MOTOR.STEPPER, 0)];
 
 function stopAll(reason) {
   for (const m of motors) {
     m.operation = OP.STOP;
-    m.target = m.motor === MOTOR.DC ? m.position : m.target;
+    m.target = m.position;
+    m.held = false;
     m.velocity = 0;
     m.status = reason;
   }
@@ -169,7 +171,9 @@ function reject(command, reason) {
     name: "motor_command",
     message: `Rejected command #${command.command_id}: ${reason}`,
     hardware_id: "ego2sim",
-    values: [{ key: "command_id", value: String(command.command_id) }],
+    values: [{ key: "command_id", value: String(command.command_id) },
+             { key: "motor", value: String(command.motor) },
+             { key: "result", value: "rejected" }],
   });
 }
 
@@ -181,15 +185,17 @@ function handleCommand(command) {
     return;
   }
   seenIds.add(id);
+  if (seenIds.size > 8) seenIds.delete(seenIds.values().next().value);
   const m = motors[motorIndex];
   if (!m) return reject(command, `unknown motor ${motorIndex}`);
   if (!Number.isFinite(target)) return reject(command, "target is not finite");
   if (operation === OP.STOP) {
     m.operation = OP.STOP;
     m.velocity = 0;
-    if (m.motor !== MOTOR.SERVO) m.target = m.position; // servo holds its position
+    m.target = m.position; // firmware holds the estimated current position
+    m.held = mode === MODE.SENSOR;
     m.lastCommandId = id;
-    m.status = "stopped by GUI";
+    m.status = m.held ? "SIMULATED stopped, sensor control paused" : "SIMULATED stopped by GUI";
     return;
   }
   if (mode !== MODE.GUI) return reject(command, "motion commands need GUI mode");
@@ -204,6 +210,9 @@ function handleCommand(command) {
   }
   if (operation === OP.VELOCITY && Math.abs(target) > DC_MAX_SPEED) {
     return reject(command, "velocity above limit");
+  }
+  if (operation === OP.MOVE_RELATIVE && Math.abs(target) > 20 * Math.PI) {
+    return reject(command, "relative move above limit");
   }
   m.operation = operation;
   m.lastCommandId = id;
@@ -278,9 +287,9 @@ function sampleSensors(t) {
   const tofTrue = 0.55 + 0.45 * Math.sin(t * 0.3 + 1);
   const tofValid = Math.random() > 0.03;
 
-  // MB1000: 9.8 mV/in from a 5 V supply, saturates at 6 in.
+  // MB1000 PW: 147 microseconds per inch, saturates at 6 inches.
   const sonar = Math.max(0.1524, 1.5 + 1.0 * Math.sin(t * 0.15) + noise(0.02));
-  const sonarVoltage = (sonar / 0.0254) * 0.0098;
+  const sonarPulseUs = (sonar / 0.0254) * 147;
 
   // TEMT6000: room light ~300 lux with a hand shadow every ~12 s.
   const luxTrue = t % 12 < 2 ? 40 : 300 + 30 * Math.sin(t * 2);
@@ -292,11 +301,11 @@ function sampleSensors(t) {
   publish("sensors/flex/angle", scalar(flexAngle * DEG));
   publish("sensors/flex/angle_filtered", scalar(filtered.flex * DEG));
   publish("sensors/ir/raw_voltage", scalar(irVoltage));
-  publish("sensors/ir/range", range(1, 0.087, 0.2, 1.5, irMeasured));
-  publish("sensors/ir/range_filtered", range(1, 0.087, 0.2, 1.5, filtered.ir));
+  publish("sensors/ir/range", range(1, NaN, 0.2, 1.5, irMeasured));
+  publish("sensors/ir/range_filtered", range(1, NaN, 0.2, 1.5, filtered.ir));
   publish("sensors/tof/range", range(1, 0.47, 0.04, 1.3, tofValid ? tofTrue + noise(0.005) : NaN));
-  publish("sensors/ultrasonic/raw_voltage", scalar(sonarVoltage));
-  publish("sensors/ultrasonic/range", range(0, 0.6, 0.1524, 6.4516, sonar));
+  publish("sensors/ultrasonic/raw_pulse_width", scalar(sonarPulseUs));
+  publish("sensors/ultrasonic/range", range(0, NaN, 0.1524, 6.4516, sonar));
   publish("sensors/light/raw_voltage", scalar(lightVoltage));
   publish("sensors/light/illuminance", { header: header(), illuminance: luxMeasured, variance: 0 });
   publish("sensors/light/illuminance_filtered", {
@@ -322,22 +331,22 @@ function stepMotors(sensors, dt) {
   const [servo, dc, stepper] = motors;
   if (mode === MODE.SENSOR) {
     // Flex 0-90 deg -> servo 0-180 deg.
-    servo.target = Math.min(Math.PI, Math.max(0, sensors.flexDeg * 2 * DEG));
-    servo.operation = OP.POSITION_ABSOLUTE;
+    if (!servo.held) servo.target = Math.min(Math.PI, Math.max(0, sensors.flexDeg * 2 * DEG));
+    if (!servo.held) servo.operation = OP.POSITION_ABSOLUTE;
     // IR: < 0.5 m reverse, > 0.9 m forward, deadband between.
     const ir = sensors.irM;
-    dc.operation = OP.VELOCITY;
-    dc.target = ir < 0.5 ? -0.5 * DC_MAX_SPEED : ir > 0.9 ? 0.5 * DC_MAX_SPEED : 0;
+    if (!dc.held) dc.operation = OP.VELOCITY;
+    if (!dc.held) dc.target = ir < 0.5 ? -0.5 * DC_MAX_SPEED : ir > 0.9 ? 0.5 * DC_MAX_SPEED : 0;
     // ToF 0.1-1.0 m -> stepper 0-360 deg, 5 deg deadband.
-    if (sensors.tofM != undefined) {
+    if (!stepper.held && sensors.tofM != undefined) {
       const goal = Math.round((((sensors.tofM - 0.1) / 0.9) * 2 * Math.PI) / STEP_RAD) * STEP_RAD;
       if (Math.abs(goal - stepper.target) > 5 * DEG) stepper.target = goal;
     }
-    stepper.operation = OP.MOVE_RELATIVE;
-    for (const m of motors) m.status = "sensor control";
+    if (!stepper.held) stepper.operation = OP.MOVE_RELATIVE;
+    for (const m of motors) if (!m.held) m.status = "SIMULATED sensor control";
   }
 
-  if (servo.operation !== OP.STOP || mode === MODE.SENSOR) moveToward(servo, SERVO_SPEED, dt);
+  if (servo.operation !== OP.STOP && !servo.held) moveToward(servo, SERVO_SPEED, dt);
   else servo.moving = false;
 
   if (dc.operation === OP.VELOCITY) {
@@ -372,16 +381,16 @@ function publishMotorStates() {
       motor: m.motor,
       control_mode: mode,
       operation: m.operation,
-      enabled: m.enabled,
+      enabled: !m.held,
       moving: m.moving,
       position_rad: m.position,
       velocity_rad_s: m.velocity,
       target: m.target,
       // Contract: encoder DC is measured; servo is commanded; stepper is step-estimated.
-      position_measured: m.motor === MOTOR.DC,
-      velocity_measured: m.motor === MOTOR.DC,
+      position_measured: false,
+      velocity_measured: false,
       last_command_id: m.lastCommandId,
-      status: m.status,
+      status: m.status.startsWith("SIMULATED") ? m.status : `SIMULATED ${m.status}`,
     });
   }
 }

@@ -1,0 +1,13 @@
+std_msgs/Header header
+uint8 motor
+uint8 control_mode
+bool enabled
+bool moving
+float64 position_rad
+float64 velocity_rad_s
+uint8 operation
+float64 target
+bool position_measured
+bool velocity_measured
+uint32 last_command_id
+string status

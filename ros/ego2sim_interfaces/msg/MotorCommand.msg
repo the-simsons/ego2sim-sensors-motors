@@ -1,0 +1,11 @@
+uint8 SERVO=0
+uint8 DC=1
+uint8 STEPPER=2
+uint8 POSITION_ABSOLUTE=0
+uint8 MOVE_RELATIVE=1
+uint8 VELOCITY=2
+uint8 STOP=3
+uint32 command_id
+uint8 motor
+uint8 operation
+float64 target
