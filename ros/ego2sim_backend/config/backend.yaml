@@ -2,24 +2,27 @@
   ros__parameters:
     port: /dev/ttyACM0
     stale_timeout_s: 1.0
-    ack_timeout_s: 1.0
+    ack_timeout_s: 2.0
     servo_min: 0.0
     servo_max: 3.141592653589793
-    move_max: 6.283185307179586
-    velocity_max: 10.0
-    # Existing sketch uses short distance mode, default full ROI.
+    move_max: 62.83185307179586   # firmware: +/-3600 degrees
+    velocity_max: 10.471975511965978  # firmware: +/-100 RPM
+    # Mark each true only after validating the calibration constants in main.ino.
+    flex_calibration_verified: false
+    light_calibration_verified: false
+    ir_calibration_verified: false
     tof_min_m: 0.04
     tof_max_m: 1.3
-    # ST datasheet: 27 degree typical full FoV with default full ROI.
     tof_fov_rad: 0.47123889803846897
-/ego2sim/sensor_processing:
-  ros__parameters:
-    filter_tau_s: 0.2
-    filter_stale_s: 1.0
-    sonar_supply_v: 5.0
     ir_fov_rad: .nan
     sonar_fov_rad: .nan
-    # Empty/unset calibration arrays intentionally produce NaN.
-    # Add measured float arrays: flex_adc / flex_angle_rad,
-    # light_voltage / light_lux, ir_voltage / ir_distance_m.
-    # Inputs MUST be increasing. No extrapolation occurs.
+/ego2sim/sensor_processing:
+  ros__parameters:
+    # Optional host_processing:=true only. Default uses firmware physical/filtered data.
+    filter_tau_s: 0.2
+    filter_stale_s: 1.0
+    sonar_us_per_inch: 147.0
+    ir_fov_rad: .nan
+    sonar_fov_rad: .nan
+    # Measured float pairs: flex_adc/flex_angle_rad, light_voltage/light_lux,
+    # ir_voltage/ir_distance_m. Inputs strictly increasing; no extrapolation.

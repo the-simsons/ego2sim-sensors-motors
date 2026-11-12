@@ -49,6 +49,8 @@ type SentCommand = MotorCommand & {
   startPositionRad?: number;
 };
 
+type CommandOutcome = { result: "accepted" | "rejected" | "unknown"; detail: string };
+
 type LoggedDiagnostic = DiagnosticStatus & { receivedAt: number };
 
 const SUBSCRIBED_TOPICS = Object.values(TOPICS).filter(
@@ -81,6 +83,7 @@ function parseNumber(text: string): number | undefined {
 function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactElement {
   const [latest, setLatest] = useState<Latest>(new Map());
   const [ackedIds, setAckedIds] = useState<ReadonlySet<number>>(new Set());
+  const [outcomes, setOutcomes] = useState<ReadonlyMap<number, CommandOutcome>>(new Map());
   const [diagLog, setDiagLog] = useState<LoggedDiagnostic[]>([]);
   const [colorScheme, setColorScheme] = useState<"dark" | "light">("dark");
   const [now, setNow] = useState(Date.now());
@@ -103,16 +106,31 @@ function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactEle
       }
       const receivedAt = Date.now();
       const newAcks: number[] = [];
+      const newOutcomes: [number, CommandOutcome][] = [];
       const newDiags: LoggedDiagnostic[] = [];
       for (const event of events) {
         if (event.topic === TOPICS.diagnostics) {
           for (const status of (event.message as DiagnosticArray).status) {
+            const values = Object.fromEntries(status.values.map(({ key, value }) => [key, value]));
+            const result = values.result;
+            if (values.command_id != undefined &&
+                (result === "accepted" || result === "rejected" || result === "unknown")) {
+              newOutcomes.push([Number(values.command_id), { result, detail: status.message }]);
+            } else {
+              const rejected = /^Rejected command #(\d+): (.*)$/.exec(status.message);
+              if (rejected) newOutcomes.push([Number(rejected[1]), {
+                result: "rejected", detail: rejected[2] ?? "rejected by firmware",
+              }]);
+            }
             if (status.level !== 0) {
               newDiags.push({ ...status, receivedAt });
             }
           }
         } else if (Object.values(MOTOR_STATE_TOPICS).includes(event.topic)) {
-          newAcks.push((event.message as MotorState).last_command_id);
+          const state = event.message as MotorState;
+          if (state.last_command_id > 0 && !state.status.startsWith("UNAVAILABLE")) {
+            newAcks.push(state.last_command_id);
+          }
         }
       }
       setLatest((prev) => {
@@ -122,12 +140,15 @@ function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactEle
         }
         return next;
       });
+      if (newOutcomes.length > 0) {
+        setOutcomes((prev) => new Map([...prev, ...newOutcomes].slice(-128)));
+      }
       if (newAcks.length > 0) {
         setAckedIds((prev) => {
           if (newAcks.every((id) => prev.has(id))) {
             return prev;
           }
-          return new Set([...prev, ...newAcks]);
+          return new Set([...prev, ...newAcks].slice(-128));
         });
       }
       if (newDiags.length > 0) {
@@ -177,11 +198,25 @@ function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactEle
     [latest, now],
   );
 
-  const motorState = (motor: Motor) => get(MOTOR_STATE_TOPICS[motor]) as Got<MotorState>;
+  const motorState = (motor: Motor): Got<MotorState> => {
+    const entry = get(MOTOR_STATE_TOPICS[motor]) as Got<MotorState>;
+    if (!entry) return undefined;
+    return { ...entry, stale: entry.stale || entry.message.status.startsWith("UNAVAILABLE") };
+  };
 
   const sendCommand = (motor: Motor, operation: Operation, target: number) => {
     if (!context.publish) {
       setError("This data source does not accept commands. Connect with Foxglove WebSocket.");
+      return;
+    }
+    const feedback = motorState(motor);
+    if (operation !== Operation.STOP &&
+        (!feedback || feedback.stale || feedback.message.control_mode !== Mode.GUI)) {
+      setError("Motion requires fresh motor feedback in GUI mode.");
+      return;
+    }
+    if (nextCommandId.current > 0xffffffff) {
+      setError("Command IDs exhausted; start a new coordinated backend/GUI session.");
       return;
     }
     const command: MotorCommand = {
@@ -190,7 +225,7 @@ function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactEle
       operation,
       target,
     };
-    nextCommandId.current = (nextCommandId.current + 1) % 2 ** 32;
+    nextCommandId.current += 1;
     try {
       context.publish(TOPICS.motorCommand, command);
       setError(undefined);
@@ -229,16 +264,21 @@ function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactEle
         ? reportedModes[0]
         : "mixed";
   const modePending = requestedMode != undefined && actualMode !== requestedMode;
-  const guiControl = actualMode !== Mode.SENSOR;
+  const guiControl = actualMode === Mode.GUI;
 
   const lastSent = (motor: Motor) => sent.find((command) => command.motor === motor);
 
   const commandStatus = (command: SentCommand): { label: string; tone: string } => {
+    const outcome = outcomes.get(command.command_id);
+    if (outcome) {
+      return { label: outcome.result === "unknown" ? "unconfirmed; outcome unknown" : outcome.result,
+               tone: outcome.result === "accepted" ? "ok" : "error" };
+    }
     if (ackedIds.has(command.command_id)) {
       return { label: "accepted", tone: "ok" };
     }
     if (now - command.sentAt > ACK_TIMEOUT_MS) {
-      return { label: "no ack (see diagnostics)", tone: "error" };
+      return { label: "unconfirmed; outcome unknown", tone: "error" };
     }
     return { label: "pending", tone: "warn" };
   };
@@ -317,7 +357,7 @@ function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactEle
           label="Ultrasonic"
           unit="cm"
           unfiltered={rangeCm(get(TOPICS.ultrasonicRange) as Got<Range>)}
-          raw={rawLine(get(TOPICS.ultrasonicRawVoltage) as Got<ScalarStamped>, "V", 3)}
+          raw={rawLine(get(TOPICS.ultrasonicRawPulseWidth) as Got<ScalarStamped>, "µs", 0)}
         />
         <SensorTile
           label="Light"
@@ -371,7 +411,7 @@ function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactEle
           />
           <StepperResult
             command={lastSent(Motor.STEPPER)}
-            state={motorState(Motor.STEPPER)?.message}
+            state={motorState(Motor.STEPPER)?.stale ? undefined : motorState(Motor.STEPPER)?.message}
           />
           <CommandLine command={lastSent(Motor.STEPPER)} status={commandStatus} />
           <StopButton
@@ -443,7 +483,7 @@ function Ego2SimPanel({ context }: { context: PanelExtensionContext }): ReactEle
 
 // --- Sensor readouts ---
 
-type Reading = { value?: number; stale: boolean; invalid: boolean } | undefined;
+type Reading = { value?: number; stale: boolean; invalid: boolean; note?: string } | undefined;
 
 function scalarDeg(entry: { message: ScalarStamped; stale: boolean } | undefined): Reading {
   if (!entry) {
@@ -457,6 +497,10 @@ function scalarDeg(entry: { message: ScalarStamped; stale: boolean } | undefined
 function rangeCm(entry: { message: Range; stale: boolean } | undefined): Reading {
   if (!entry) {
     return undefined;
+  }
+  if (entry.message.range === Infinity || entry.message.range === -Infinity) {
+    return { stale: entry.stale, invalid: false,
+             note: entry.message.range > 0 ? "beyond range" : "closer than minimum" };
   }
   const invalid = !Number.isFinite(entry.message.range);
   return { value: invalid ? undefined : mToCm(entry.message.range), stale: entry.stale, invalid };
@@ -495,7 +539,7 @@ function SensorTile(props: {
   const main = filtered ?? unfiltered;
   const tone = main == undefined ? "missing" : main.stale ? "warn" : main.invalid ? "error" : "ok";
   const note =
-    main == undefined ? "no data" : main.stale ? "stale" : main.invalid ? "invalid" : undefined;
+    main == undefined ? "no data" : main.stale ? "stale" : main.invalid ? "invalid" : main.note;
   return (
     <div className="e2s-card e2s-sensor">
       <div className="e2s-sensor-head">
@@ -830,7 +874,9 @@ function StepperResult(props: {
   if (
     command?.operation !== Operation.MOVE_RELATIVE ||
     command.startPositionRad == undefined ||
-    state == undefined
+    state == undefined ||
+    state.last_command_id !== command.command_id ||
+    !Number.isFinite(state.position_rad)
   ) {
     return <></>;
   }

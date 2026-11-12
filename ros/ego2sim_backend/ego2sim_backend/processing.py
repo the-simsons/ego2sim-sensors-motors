@@ -49,3 +49,12 @@ def sonar(voltage, supply):
     if not math.isfinite(inches) or inches < 6-1e-9 or inches > 254+1e-9:
         return NAN
     return min(254., max(6., inches))*0.0254
+
+
+def sonar_pulse(pulse_us, us_per_inch=147.):
+    if not math.isfinite(us_per_inch) or us_per_inch <= 0:
+        raise ValueError('Sonar scale must be finite and positive')
+    inches = pulse_us/us_per_inch
+    if not math.isfinite(inches) or not 6-1e-9 <= inches <= 254+1e-9:
+        return NAN
+    return min(254.,max(6.,inches))*.0254
